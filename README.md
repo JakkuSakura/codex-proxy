@@ -8,6 +8,60 @@ This proxy fixes that by sitting between Codex and the API, converting `develope
 
 The proxy listens on localhost (port 8765 by default), rewrites the role field in the messages array, and forwards everything else unchanged. Responses pass straight through.
 
+## Setting up Z.AI with Codex
+
+If you're starting from scratch, here's how to get Z.AI's GLM models working with Codex:
+
+### 1. Get a Z.AI API key
+
+1. Go to [https://open.bigmodel.cn/](https://open.bigmodel.cn/)
+2. Sign up and get your API key
+3. Export it as an environment variable:
+
+```bash
+# Add to ~/.zshrc or ~/.bashrc
+export Z_AI_API_KEY="your-api-key-here"
+
+# Then reload your shell
+source ~/.zshrc  # or source ~/.bashrc
+```
+
+### 2. Install Codex CLI
+
+```bash
+npm install -g @anthropic-ai/claude-code
+```
+
+### 3. Configure Codex for Z.AI
+
+Edit `~/.codex/config.toml`:
+
+```toml
+[model_providers.z_ai]
+name = "z.ai - GLM Coding Plan"
+base_url = "http://localhost:8765"
+env_key = "Z_AI_API_KEY"
+wire_api = "chat"
+
+[profiles.glm_4_6]
+model = "glm-4.6"
+model_provider = "z_ai"
+```
+
+The key is setting `base_url` to `http://localhost:8765` (the proxy) instead of the direct Z.AI API URL.
+
+### 4. Install and start the proxy
+
+See the Installation section below.
+
+### 5. Test it
+
+```bash
+codex -p glm_4_6 'hello world'
+```
+
+If it works without the "Incorrect role information" error, you're all set.
+
 ## Installation
 
 Clone the repo and set up the systemd service:
