@@ -29,9 +29,7 @@ source ~/.zshrc  # or source ~/.bashrc
 ### 2. Install Codex CLI
 
 ```bash
-npm install -g @anthropic-ai/claude-code
-# or
-bun install -g @anthropic-ai/claude-code
+npm i -g @openai/codex
 ```
 
 ### 3. Configure Codex for Z.AI
