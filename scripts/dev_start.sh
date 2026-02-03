@@ -1,6 +1,8 @@
 #!/bin/bash
 # Starts the development environment
 # Rebuilds if necessary to catch dependency changes
+set -euo pipefail
+
 docker-compose up -d --build --force-recreate
 echo "Waiting for proxy to be ready..."
 sleep 2

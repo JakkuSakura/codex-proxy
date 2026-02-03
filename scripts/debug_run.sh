@@ -1,8 +1,8 @@
 #!/bin/bash
 # Fast iteration script for testing Codex with the proxy.
-# Usage: ./scripts/debug_run.sh "your prompt here"
+# Usage: ./scripts/debug_run.sh -- "your prompt here"
 
-set -e
+set -euo pipefail
 
 # 1. Rebuild and restart proxy
 echo "Rebuilding and restarting proxy..."
@@ -13,13 +13,22 @@ echo "Waiting for proxy to be ready..."
 sleep 2
 
 # 3. Run Codex test
-PROMPT="${1:-hi}"
 echo "--------------------------------------------------------"
-echo "Running Codex test with prompt: $PROMPT"
+echo "Running Codex test..."
 echo "--------------------------------------------------------"
 
-# Ensure we use the right model if needed, but proxy handles fallback
-/home/user/.npm-global/bin/codex exec "$PROMPT"
+# Use codex from PATH
+if ! command -v codex &> /dev/null; then
+    echo "Error: 'codex' command not found in PATH."
+    exit 1
+fi
+
+# Handle optional -- separator
+if [[ "${1:-}" == "--" ]]; then
+    shift
+fi
+
+codex exec "$@"
 
 echo "--------------------------------------------------------"
 echo "Test complete. Check 'docker logs codex-proxy' for details."

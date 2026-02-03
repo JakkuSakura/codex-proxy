@@ -1,64 +1,81 @@
-# Gemini Proxy for Codex
+# codex-proxy
 
-I built this proxy because I wanted Gemini models to work properly in Codex without the usual protocol mismatch issues. Native models in Codex use a specific Responses API that Gemini doesn't quite match out of the box—especially when it comes to reasoning streams, tool calls, and context management.
+Codex-proxy is an intermediary service for the Codex CLI. It bridges Codex's specialized "Responses API" with standard AI providers like Z.AI and Gemini, fixing role incompatibilities and adding features like automated context compaction.
 
-This proxy sits between the Codex binary and Google's internal APIs. It maps Gemini's output to the strict JSON SSE format Codex expects, so you get stable reasoning "Thinking" blocks, reliable terminal commands, and proper history compaction.
+## What it does
 
-## Why this exists
+- **Bridge the Responses API**: Codex uses a proprietary Responses API for complex tasks. This proxy translates those requests into standard Chat Completions that most providers understand.
+- **Fix role errors**: Some providers (like Z.AI) crash when they see the `developer` role. The proxy automatically maps `developer` to `system` so your requests actually go through.
+- **Power up Gemini**: It has deep support for Gemini 2.0 and 3.0, including "thinking" blocks, JSON schemas, and automatic model fallbacks if you hit rate limits.
+- **Auto-compact history**: When a conversation gets too long, the proxy uses a fast model (like Gemini Flash Lite) to summarize the history, keeping your context window clean without manual effort.
+- **Low latency**: It's built with multi-threading and optimized JSON handling (`orjson`) to keep overhead minimal.
 
-If you've tried using Gemini directly in Codex, you probably noticed the "..." status indicator flickering or the stream disconnecting during complex tasks. I fixed that by:
-- Splitting Gemini's reasoning stream into professional summaries that the terminal UI can actually track.
-- Implementing a custom `/v1/responses/compact` endpoint using Gemini Flash Lite so history stays manageable.
-- Mapping image perception to the native `<image>` tag standard.
-- Ensuring turn-state persists across multiple requests so the agent doesn't lose its mind.
+## Supported providers
+
+### Gemini
+The proxy handles the heavy lifting for Gemini—authentication, project IDs, and specific model settings. It supports the latest thinking/reasoning models and handles streaming responses natively.
+
+### Z.AI (GLM)
+If you're using Z.AI's GLM models, this proxy fixes the common "Incorrect role information" error (code 1214) by cleaning up the message roles before they hit the API.
 
 ## Setup
 
-### 1. Credentials
-The proxy uses your existing Gemini CLI credentials. Ensure you have authenticated via `gemini-cli auth login` first.
-
-You'll need to create a simple config file at `~/.gemini/proxy_config.json` with your Google OAuth client info:
-
-```json
-{
-  "client_id": "YOUR_CLIENT_ID",
-  "client_secret": "YOUR_CLIENT_SECRET"
-}
-```
-
-*Note: You can find these in the gemini-cli source code or your Google Cloud Console.*
-
-### 2. Run with Docker (Recommended)
-I use Docker because it keeps the environment clean. From the `codex-proxy` directory:
+### Run with Docker (Recommended)
+The easiest way to get started is using the included scripts:
 
 ```bash
+# Start the proxy in the background
 ./scripts/dev_start.sh
 ```
 
-This starts the proxy on port `8765`. It mounts your `~/.gemini` folder so it can access your tokens.
+The proxy will listen on `http://localhost:8765`.
 
-### 3. Point Codex to the Proxy
-Update your `~/.codex/config.toml` (or your active profile) to use the proxy:
+### Run locally
+If you don't want to use Docker:
 
+1. Install the requirements: `pip install -r requirements.txt`
+2. Start the service: `python -m src.codex_proxy`
+
+## Configuration
+
+You can tweak the proxy using environment variables or by editing `~/.gemini/proxy_config.json`.
+
+- `PORT`: Where the proxy listens (default: `8765`)
+- `Z_AI_API_KEY`: Your Z.AI key (passed via Codex)
+- `GEMINI_CLIENT_ID` / `SECRET`: Credentials for Gemini internal APIs
+- `DEBUG`: Set to `true` for detailed request logs
+
+## Connecting Codex
+
+Once the proxy is running, tell Codex to use it by updating your `~/.codex/config.toml`.
+
+### Z.AI Example
 ```toml
-[model_provider]
-name = "gemini-proxy"
-base_url = "http://localhost:8765/v1"
-wire_api = "responses"
+[model_providers.z_ai]
+name = "z.ai - GLM"
+base_url = "http://localhost:8765"
+env_key = "Z_AI_API_KEY"
+wire_api = "chat"
 
-[model]
-default = "gemini-3-flash-preview"
+[profiles.glm_4]
+model = "glm-4.0"
+model_provider = "z_ai"
 ```
 
-## Features I added
+### Gemini Example
+```toml
+[model_providers.gemini_proxy]
+name = "Gemini Proxy"
+base_url = "http://localhost:8765"
+wire_api = "responses"
 
-- **High-Fidelity Reasoning:** Concurrent streaming of reasoning deltas and summaries. The terminal status indicator actually works.
-- **Context Compaction:** When history gets too long, Codex calls the proxy's compact endpoint. I use Gemini 1.5 Flash Lite here to keep it fast and cheap.
-- **Strict JSON Schema:** If Codex requests a specific JSON format, the proxy enforces it via Gemini's native responseSchema.
-- **Automatic 429 Retries:** If you hit rate limits, the proxy handles the wait and retry logic internally.
+[profiles.gemini_3]
+model = "gemini-3-pro-preview"
+model_provider = "gemini_proxy"
+```
 
-## Safety and Soul
+## Testing & Debugging
 
-I stripped out all hardcoded secrets. You have to provide your own client ID and secret via the config file or environment variables (`GEMINI_CLIENT_ID`, `GEMINI_CLIENT_SECRET`). 
+- Use `./scripts/debug_run.sh -- "your prompt"` to rebuild the proxy and run a quick test.
+- Use `./scripts/logs.sh` to see real-time proxy traffic.
 
-The code is meant to be pragmatic. I've tuned the system instructions to make Gemini act more like a senior engineer—direct, pragmatic, and focused on the root cause rather than surface-level fixes.

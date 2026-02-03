@@ -18,7 +18,7 @@ Always execute these scripts from the `codex-proxy/` root directory.
 | :--- | :--- |
 | `dev_start.sh` | Builds and starts the proxy container in the background. |
 | `dev_stop.sh` | Shuts down the proxy container. |
-| `debug_run.sh [prompt]` | Rebuilds the container, tails logs, and runs a test `codex exec` command. |
+| `debug_run.sh -- "prompt"` | Rebuilds the container and runs a `codex exec` command with the provided prompt. |
 | `logs.sh` | Streams real-time logs from the `codex-proxy` container. |
 | `test.sh` | Runs Python integration tests against the live proxy instance. |
 
