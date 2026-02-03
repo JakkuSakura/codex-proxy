@@ -1,133 +1,64 @@
-# codex-proxy
+# Gemini Proxy for Codex
 
-Codex CLI uses a `developer` role for some messages, but custom API providers like Z.AI don't accept it. Their Chat Completions endpoint only recognizes `system`, `user`, `assistant`, and `tool`. When Codex sends `developer`, Z.AI returns error 1214 ("Incorrect role information") and the request fails.
+I built this proxy because I wanted Gemini models to work properly in Codex without the usual protocol mismatch issues. Native models in Codex use a specific Responses API that Gemini doesn't quite match out of the box—especially when it comes to reasoning streams, tool calls, and context management.
 
-This proxy fixes that by sitting between Codex and the API, converting `developer` to `system` before forwarding the request. Codex doesn't know the difference.
+This proxy sits between the Codex binary and Google's internal APIs. It maps Gemini's output to the strict JSON SSE format Codex expects, so you get stable reasoning "Thinking" blocks, reliable terminal commands, and proper history compaction.
 
-## How it works
+## Why this exists
 
-The proxy listens on localhost (port 8765 by default), rewrites the role field in the messages array, and forwards everything else unchanged. Responses pass straight through.
+If you've tried using Gemini directly in Codex, you probably noticed the "..." status indicator flickering or the stream disconnecting during complex tasks. I fixed that by:
+- Splitting Gemini's reasoning stream into professional summaries that the terminal UI can actually track.
+- Implementing a custom `/v1/responses/compact` endpoint using Gemini Flash Lite so history stays manageable.
+- Mapping image perception to the native `<image>` tag standard.
+- Ensuring turn-state persists across multiple requests so the agent doesn't lose its mind.
 
-## Setting up Z.AI with Codex
+## Setup
 
-If you're starting from scratch, here's how to get Z.AI's GLM models working with Codex:
+### 1. Credentials
+The proxy uses your existing Gemini CLI credentials. Ensure you have authenticated via `gemini-cli auth login` first.
 
-### 1. Get a Z.AI API key
+You'll need to create a simple config file at `~/.gemini/proxy_config.json` with your Google OAuth client info:
 
-1. Go to [https://z.ai/manage-apikey/subscription](https://z.ai/manage-apikey/subscription)
-2. Sign up and get your API key
-3. Export it as an environment variable:
-
-```bash
-# Add to ~/.zshrc or ~/.bashrc
-export Z_AI_API_KEY="your-api-key-here"
-
-# Then reload your shell
-source ~/.zshrc  # or source ~/.bashrc
+```json
+{
+  "client_id": "YOUR_CLIENT_ID",
+  "client_secret": "YOUR_CLIENT_SECRET"
+}
 ```
 
-### 2. Install Codex CLI
+*Note: You can find these in the gemini-cli source code or your Google Cloud Console.*
+
+### 2. Run with Docker (Recommended)
+I use Docker because it keeps the environment clean. From the `codex-proxy` directory:
 
 ```bash
-npm i -g @openai/codex
+./scripts/dev_start.sh
 ```
 
-### 3. Configure Codex for Z.AI
+This starts the proxy on port `8765`. It mounts your `~/.gemini` folder so it can access your tokens.
 
-Edit `~/.codex/config.toml`:
+### 3. Point Codex to the Proxy
+Update your `~/.codex/config.toml` (or your active profile) to use the proxy:
 
 ```toml
-[model_providers.z_ai]
-name = "z.ai - GLM Coding Plan"
-base_url = "http://localhost:8765"
-env_key = "Z_AI_API_KEY"
-wire_api = "chat"
+[model_provider]
+name = "gemini-proxy"
+base_url = "http://localhost:8765/v1"
+wire_api = "responses"
 
-[profiles.glm_4_6]
-model = "glm-4.6"
-model_provider = "z_ai"
+[model]
+default = "gemini-3-flash-preview"
 ```
 
-The key is setting `base_url` to `http://localhost:8765` (the proxy) instead of the direct Z.AI API URL.
+## Features I added
 
-### 4. Install and start the proxy
+- **High-Fidelity Reasoning:** Concurrent streaming of reasoning deltas and summaries. The terminal status indicator actually works.
+- **Context Compaction:** When history gets too long, Codex calls the proxy's compact endpoint. I use Gemini 1.5 Flash Lite here to keep it fast and cheap.
+- **Strict JSON Schema:** If Codex requests a specific JSON format, the proxy enforces it via Gemini's native responseSchema.
+- **Automatic 429 Retries:** If you hit rate limits, the proxy handles the wait and retry logic internally.
 
-See the Installation section below.
+## Safety and Soul
 
-### 5. Test it
+I stripped out all hardcoded secrets. You have to provide your own client ID and secret via the config file or environment variables (`GEMINI_CLIENT_ID`, `GEMINI_CLIENT_SECRET`). 
 
-```bash
-codex -p glm_4_6 'hello world'
-```
-
-If it works without the "Incorrect role information" error, you're all set.
-
-## Installation
-
-Clone the repo and set up the systemd service:
-
-```bash
-# Copy the service file
-cp systemd/codex-proxy.service ~/.config/systemd/user/
-
-# Edit the TARGET_API_URL in proxy.py if you're using a different endpoint
-# Then enable and start
-systemctl --user daemon-reload
-systemctl --user enable --now codex-proxy.service
-```
-
-## Configuration
-
-Update your Codex config (`~/.codex/config.toml`) to point at the proxy:
-
-```toml
-[model_providers.z_ai]
-name = "z.ai - GLM Coding Plan"
-base_url = "http://localhost:8765"
-env_key = "Z_AI_API_KEY"
-wire_api = "chat"
-```
-
-If you need a different port, edit `PROXY_PORT` in `proxy.py`.
-
-## Service management
-
-```bash
-# Check status
-systemctl --user status codex-proxy.service
-
-# Restart
-systemctl --user restart codex-proxy.service
-
-# Follow logs
-journalctl --user -u codex-proxy.service -f
-
-# Stop auto-start at boot
-systemctl --user disable codex-proxy.service
-```
-
-## Testing
-
-```bash
-codex -p glm_4_6 'hello world'
-```
-
-If you don't get the role error, it's working.
-
-## Troubleshooting
-
-Still getting error 1214?
-
-1. Verify the proxy is running (`systemctl --user status codex-proxy.service`)
-2. Confirm `base_url` in your Codex config is `http://localhost:8765`, not the original API URL
-3. Check that `Z_AI_API_KEY` is set (`echo $Z_AI_API_KEY`)
-4. Check proxy logs for errors (`journalctl --user -u codex-proxy.service -n 50`)
-
-## Uninstall
-
-```bash
-systemctl --user stop codex-proxy.service
-systemctl --user disable codex-proxy.service
-rm ~/.config/systemd/user/codex-proxy.service
-# Revert base_url in ~/.codex/config.toml to the original API URL
-```
+The code is meant to be pragmatic. I've tuned the system instructions to make Gemini act more like a senior engineer—direct, pragmatic, and focused on the root cause rather than surface-level fixes.

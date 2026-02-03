@@ -1,0 +1,18 @@
+services:
+  codex-proxy:
+    build: .
+    container_name: codex-proxy
+    ports:
+      - "8765:8765"
+    volumes:
+      # Mount the host's Gemini credentials
+      - ${HOME}/.gemini:/home/appuser/.gemini:rw
+      # Mount the source code for runtime updates
+      - ./src:/app/src:rw
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=DEBUG
+      # Optional: Override via environment if needed
+      # - GEMINI_CLIENT_ID=...
+      # - GEMINI_CLIENT_SECRET=...
