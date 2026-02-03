@@ -195,13 +195,21 @@ class GeminiProvider(BaseProvider):
         pid = self.auth.get_project_id(token)
         
         # Subagent optimized model selection
-        subagent = req_data.get('_headers', {}).get('x-openai-subagent')
+        headers_dict = req_data.get('_headers') or {}
+        subagent = headers_dict.get('x-openai-subagent')
         if subagent in ('compact', 'review') and not model.startswith('gemini-2.5-flash'):
             model = 'gemini-2.5-flash-lite'
             logger.info(f"Subagent '{subagent}' detected. Using faster model: {model}")
 
+        # Native Parity: Personality Injection
+        # We inject a 'virtual' system message that gemini_utils.map_messages understands
+        personality = headers_dict.get('x-codex-personality') or config.default_personality
+        messages = req_data.get('messages') or []
+        # Insert at the beginning to ensure it's processed first
+        messages.insert(0, {"role": "system", "content": f"personality:{personality}"})
+
         display_model = display_model or model
-        contents, system_instruction = map_messages(req_data.get('messages', []), model)
+        contents, system_instruction = map_messages(messages, model)
         if not contents: contents = [{'role': 'user', 'parts': [{'text': '...'}]}]
         
         tools = []
@@ -212,11 +220,26 @@ class GeminiProvider(BaseProvider):
         max_tokens = req_data.get('max_tokens') or req_data.get('maxOutputTokens') or 8192
         gen_config = {"temperature": req_data.get('temperature', 1.0), "topP": 0.95, "topK": 64, "maxOutputTokens": max_tokens}
         
-        # Thinking Config Parity
+        # Thinking Config Parity (4-tier mapping)
+        effort = (req_data.get('reasoning') or {}).get('effort', 'medium')
+        budget = config.default_thinking_budget
+        level = config.default_thinking_level
+        
+        if effort == 'low':
+            budget, level = 4096, "LOW"
+        elif effort == 'medium':
+            budget, level = 16384, "MEDIUM"
+        elif effort == 'high':
+            budget, level = 32768, "HIGH"
+        elif effort == 'xhigh':
+            budget, level = 65536, "HIGH"
+            # XHigh also injects a prompt hint via system instruction
+            if system_instruction:
+                system_instruction['parts'][0]['text'] += "\n\nCRITICAL: Provide an extremely thorough, step-by-step reasoning process before providing the final answer."
+
         if model.startswith('gemini-3'):
-            gen_config["thinkingConfig"] = {"includeThoughts": True, "thinkingLevel": req_data.get('thinking_level', config.default_thinking_level)}
+            gen_config["thinkingConfig"] = {"includeThoughts": True, "thinkingLevel": level}
         else:
-            budget = req_data.get('thinking_budget') or config.default_thinking_budget
             if budget > 0:
                 gen_config["thinkingConfig"] = {"thinkingBudget": budget, "includeThoughts": True}
 
@@ -225,7 +248,7 @@ class GeminiProvider(BaseProvider):
             "request": {
                 "contents": contents, 
                 "generationConfig": gen_config,
-                "session_id": str(req_data.get('_headers', {}).get('session_id') or req_data.get('conversation_id') or f"s-{int(time.time())}")
+                "session_id": str(headers_dict.get('session_id') or req_data.get('conversation_id') or f"s-{int(time.time())}")
             }
         }
         
@@ -240,42 +263,25 @@ class GeminiProvider(BaseProvider):
             request_body['request']['cachedContent'] = cache_key
 
         # Verbosity
-        verbosity = req_data.get('text', {}).get('verbosity', 'medium')
+        verbosity = (req_data.get('text') or {}).get('verbosity', 'medium')
+        v_instr = None
         if verbosity == 'low': v_instr = "Respond very concisely and briefly."
         elif verbosity == 'high': v_instr = "Respond with very detailed and comprehensive information."
-        else: v_instr = None
         
-        if v_instr:
-            if system_instruction: system_instruction['parts'].append({'text': v_instr})
-            else: system_instruction = {'parts': [{'text': v_instr}]}
+        if v_instr and system_instruction:
+            system_instruction['parts'][0]['text'] += f"\n{v_instr}"
 
         # JSON Schema - Deep Support
-        text_ctrl = req_data.get('text', {})
+        text_ctrl = req_data.get('text') or {}
         if text_ctrl.get('format', {}).get('type') == 'json_schema':
             schema = text_ctrl['format'].get('schema')
             if schema:
                 gen_config["responseMimeType"] = "application/json"
                 gen_config["responseSchema"] = schema
                 # Force JSON instructions if not strictly enforced by API version
-                json_prompt = "Output the response strictly as JSON matching the requested schema."
-                if system_instruction: system_instruction['parts'].append({'text': json_prompt})
-                else: system_instruction = {'parts': [{'text': json_prompt}]}
-
-        # High-Quality Output Injection
-        # These rules are derived from codex-rs/core/templates and base_instructions
-        hq_rules = [
-            "**Rigorous Constraints**",
-            "- Use Title Case for section headers wrapped in **…** (e.g., **Key Findings**).",
-            "- Never use nested bullets. Keep all lists flat (single level).",
-            "- When using 'apply_patch', strictly follow the grammar: '*** Begin Patch', '*** Update File: <path>', '@@', etc.",
-            "- Use relative file paths only. NEVER use absolute paths or file:// URIs.",
-            "- state the solution first, then walk the user through what you did and why.",
-            "- Adopt 'Senior Engineer Energy': be pragmatic, direct, and collaborative. Avoid cheerleading.",
-            "- Ensure all 'Thinking' blocks are detailed and technical. Use headers like '**Analyzing context**' inside reasoning."
-        ]
-        hq_prompt = "\n".join(hq_rules)
-        if system_instruction: system_instruction['parts'].append({'text': hq_prompt})
-        else: system_instruction = {'parts': [{'text': hq_prompt}]}
+                json_prompt = "\nOutput the response strictly as JSON matching the requested schema."
+                if system_instruction:
+                    system_instruction['parts'][0]['text'] += json_prompt
 
         if system_instruction: request_body['request']['systemInstruction'] = system_instruction
         
@@ -283,12 +289,14 @@ class GeminiProvider(BaseProvider):
         if tools:
             if 'tools' not in request_body['request']: request_body['request']['tools'] = []
             request_body['request']['tools'].append({'functionDeclarations': tools})
+            
+            # GPT-5.2 Parity: Enforce ANY mode for tool calls to ensure proactivity
             tc = req_data.get('tool_choice', 'auto')
             mode = "AUTO" if tc == "auto" else ("NONE" if tc == "none" else "ANY")
-            if req_data.get('_is_responses_api') and tc == 'auto':
-                messages = req_data.get('messages', [])
-                if not (messages and messages[-1].get('role') == 'tool'):
-                    mode = "ANY"
+            
+            # Native parity: if it's a first turn or tool choice is auto, favor ANY to match gpt-5.2 proactivity
+            if mode == "AUTO": mode = "ANY"
+            
             request_body['request']['toolConfig'] = {"functionCallingConfig": {"mode": mode}}
 
         url = f"{config.gemini_api_base}/v1internal:streamGenerateContent?alt=sse"
@@ -297,7 +305,7 @@ class GeminiProvider(BaseProvider):
         # Turn State forward/backward persistence
         if req_data.get('store'):
             headers['x-codex-store'] = 'true'
-            ts = req_data.get('_headers', {}).get('x-codex-turn-state')
+            ts = headers_dict.get('x-codex-turn-state')
             if ts: headers['x-codex-turn-state'] = ts
 
         logger.debug(f"Gemini Request Body: {orjson.dumps(request_body).decode()}")

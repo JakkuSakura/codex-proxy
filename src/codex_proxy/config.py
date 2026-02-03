@@ -37,6 +37,7 @@ class Config:
     
     # Models
     gemini_models: List[str] = field(default_factory=lambda: DEFAULT_GEMINI_MODELS)
+    default_personality: str = "pragmatic"
     
     # Auth
     client_id: str = field(default_factory=lambda: os.environ.get('GEMINI_CLIENT_ID', DEFAULT_CLIENT_ID))

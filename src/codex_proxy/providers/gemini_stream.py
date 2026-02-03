@@ -55,7 +55,7 @@ def stream_responses_loop(resp, wfile, model, created_ts, headers_sent=False):
     })
     
     # 2. Native Telemetry: Models Etag
-    send_evt("models_etag", {"etag": "v1-gemini-deep-parity"})
+    send_evt("models_etag", {"etag": "v1-gemini-gpt-5-2-parity"})
     
     # 3. Native Telemetry: Server Reasoning Included
     # Gemini internal API always accounts for its own reasoning tokens in candidatesTokenCount

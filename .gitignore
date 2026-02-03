@@ -209,3 +209,4 @@ __marimo__/
 proxy_config.json
 oauth_creds.json
 secrets.json
+/reference/
