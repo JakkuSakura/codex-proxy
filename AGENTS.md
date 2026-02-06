@@ -65,9 +65,9 @@ The primary goal of `codex-proxy` is to ensure seamless compatibility between mu
 
 **Multi-Provider Support:**
 
-- **Gemini Provider** (`gemini*` models): Uses Google's internal and public APIs with OAuth2 authentication
-- **Z.AI Provider** (`glm*`, `zai*` models): Uses Z.AI's coding-focused API with Bearer token authentication
-- **Provider Registry**: Automatically routes requests based on model prefixes
+- **Gemini Provider** (`gemini*` models by default): Uses Google's internal and public APIs with OAuth2 authentication
+- **Z.AI Provider** (`glm*`, `zai*` models by default): Uses Z.AI's coding-focused API with Bearer token authentication
+- **Provider Registry**: Dynamically configured via `config.model_prefixes` to map model prefixes to providers
 
 **Request Normalization** (`normalizer.py`):
 
@@ -93,13 +93,18 @@ The primary goal of `codex-proxy` is to ensure seamless compatibility between mu
 - **Reasoning Extraction**: Parse Gemini's internal reasoning format and convert to OpenAI-compatible `reasoning_content`
 - **Tool Call Mapping**: Convert Gemini's function calling format to OpenAI's `tool_calls` structure
 - **Token Usage**: Map Gemini's token counts including `thinkingTokenCount` to OpenAI usage format
+- **Model Configuration**: Use `config.models` for model list, `config.compaction_model` for compaction, `config.fallback_models` for fallback logic
+- **Reasoning Configuration**: Use `config.reasoning` for customizable effort levels, with `config.reasoning_effort` as default
+- **Dynamic Provider Routing**: Use `config.model_prefixes` for custom model prefix to provider mappings
+- **Compaction Provider Selection**: For `/compact` endpoints, provider is determined by `config.compaction_model` (not the request's model), ensuring compaction works with any selected model. Both Gemini and Z.AI models support compaction.
+- **Reasoning Configuration**: Use `config.reasoning` for customizable effort levels and budgets
 
 **Z.AI Integration:**
 
 - **API Endpoint**: Use dedicated coding API at `https://api.z.ai/api/coding/paas/v4/chat/completions`
 - **Streaming**: Handle Z.AI's SSE streaming format with proper chunk processing
 - **Tool Call Support**: Process Z.AI's tool call deltas and assemble complete function calls
-- **Model Support**: Support GLM models (glm-4.6, glm-4.7, etc.) with proper model prefix routing
+- **Model Support**: Accept any GLM model name via configuration, with prefix-based routing to Z.AI provider. Both chat completions and compaction endpoints are supported.
 
 ### Implementation Specifications
 

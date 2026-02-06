@@ -1,0 +1,11 @@
+# Core dependencies
+requests>=2.31.0
+urllib3>=2.0.0
+responses>=0.23.0
+orjson>=3.9.0
+
+# Development dependencies
+pytest>=7.4.0
+pytest-responses>=0.24.0
+ruff>=0.1.0
+mypy>=1.7.0

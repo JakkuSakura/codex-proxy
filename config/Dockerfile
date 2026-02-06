@@ -12,13 +12,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY src ./src
 
-# Set python path
+# Set python path and defaults
 ENV PYTHONPATH=/app/src
 ENV PYTHONUNBUFFERED=1
-ENV LOG_LEVEL=DEBUG
-ENV DEBUG=true
-
-# Entry point
+ENV LOG_LEVEL=INFO
 
 # Expose port
 EXPOSE 8765

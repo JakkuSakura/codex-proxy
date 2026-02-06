@@ -44,8 +44,13 @@ case "$COMMAND" in
         ;;
     test)
         echo "Running tests..."
-        pytest
+        if ! command -v pytest &> /dev/null; then
+            echo "Error: pytest not found. Install with: pip install pytest pytest-responses"
+            exit 1
+        fi
+        pytest tests/ -v
         ;;
+
     run)
         # --- `run` command logic (from debug_run.sh) ---
         PROFILE=""

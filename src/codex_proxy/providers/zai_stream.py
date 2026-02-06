@@ -1,25 +1,9 @@
 import time
 import logging
 import requests
-import json
 from typing import Dict, Any, Optional, List
 
-try:
-    import orjson
-
-    def json_dumps(data: Any) -> bytes:
-        return orjson.dumps(data)
-
-    def json_loads(data: bytes | str) -> Any:
-        return orjson.loads(data)
-except ImportError:
-
-    def json_dumps(data: Any) -> bytes:
-        return json.dumps(data).encode("utf-8")
-
-    def json_loads(data: bytes | str) -> Any:
-        return json.loads(data)
-
+from ..utils import json_dumps, json_loads
 
 logger = logging.getLogger(__name__)
 

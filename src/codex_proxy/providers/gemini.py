@@ -4,27 +4,9 @@ import logging
 import requests
 from typing import Dict, Any, List, Optional, Tuple, cast
 
-try:
-    import orjson
-
-    def json_dumps(data: Any) -> bytes:
-        return orjson.dumps(data)
-
-    def json_loads(data: bytes | str) -> Any:
-        return orjson.loads(data)
-except ImportError:
-    import json as orjson  # type: ignore
-
-    def json_dumps(data: Any) -> bytes:
-        return json.dumps(data).encode("utf-8")
-
-    def json_loads(data: bytes | str) -> Any:
-        return json.loads(data)
-
-
 from ..config import config
 from ..auth import GeminiAuth, AuthError
-from ..utils import create_session
+from ..utils import create_session, json_loads, json_dumps
 from .base import BaseProvider
 from .gemini_utils import map_messages, sanitize_params
 from .gemini_stream import stream_responses_loop
@@ -52,13 +34,17 @@ class GeminiProvider(BaseProvider):
         self._stream_request(data, handler)
 
     def handle_compact(self, data: Dict[str, Any], handler: Any) -> None:
-        """Handle context compaction using Flash models."""
+        """Handle context compaction using configured compaction model."""
         try:
             auth_ctx = self.auth.get_auth_context()
 
+            compaction_model = config.compaction_model or self._get_compaction_model(
+                data
+            )
+
             # Map messages specifically for compaction
             contents, system_instruction = map_messages(
-                data.get("input", []), "gemini-2.5-flash-lite"
+                data.get("input", []), compaction_model
             )
 
             compaction_prompt = data.get(
@@ -81,7 +67,7 @@ class GeminiProvider(BaseProvider):
                 url = f"{config.gemini_api_internal}/v1internal:streamGenerateContent?alt=sse"
                 headers = {"Authorization": f"Bearer {auth_ctx['access_token']}"}
                 request_body = {
-                    "model": "gemini-2.5-flash-lite",
+                    "model": compaction_model,
                     "project": auth_ctx["project_id"],
                     "request": {
                         "contents": contents,
@@ -92,7 +78,7 @@ class GeminiProvider(BaseProvider):
                     request_body["request"]["systemInstruction"] = system_instruction
             else:
                 # Public API
-                url = f"{config.gemini_api_public}/v1beta/models/gemini-2.5-flash-lite:streamGenerateContent?alt=sse&key={auth_ctx['api_key']}"
+                url = f"{config.gemini_api_public}/v1beta/models/{compaction_model}:streamGenerateContent?alt=sse&key={auth_ctx['api_key']}"
                 headers = {}
                 request_body = {
                     "contents": contents,
@@ -147,10 +133,19 @@ class GeminiProvider(BaseProvider):
                     continue
         return final_text
 
+    def _get_compaction_model(self, req_data: Dict[str, Any]) -> str:
+        """Get appropriate compaction model from request or config."""
+        requested_model = req_data.get("model", "")
+        if requested_model and config.compaction_model:
+            return config.compaction_model
+        return config.models[0] if config.models else "gemini-2.5-flash-lite"
+
     def _stream_request(self, req_data: Dict[str, Any], handler: Any) -> None:
         """Managed streaming request with retry and fallback logic."""
         is_responses_api = bool(req_data.get("_is_responses_api", False))
-        requested_model = req_data.get("model", config.gemini_models[0])
+        requested_model = req_data.get(
+            "model", config.models[0] if config.models else "gemini-2.5-flash"
+        )
 
         # Primary attempt with potential retry
         for attempt in range(2):
@@ -175,11 +170,16 @@ class GeminiProvider(BaseProvider):
                 return
 
         # Fallback logic
-        fallback_model = (
-            "gemini-2.5-flash"
-            if requested_model != "gemini-2.5-flash"
-            else "gemini-2.5-flash-lite"
+        fallback_model = config.fallback_models.get(
+            requested_model, self._smart_fallback(requested_model)
         )
+
+        if not fallback_model:
+            logger.warning(f"No fallback model configured for {requested_model}")
+            error = Exception(f"No fallback available for model {requested_model}")
+            self._report_error(handler, error, is_responses_api)
+            return
+
         logger.info(f"Trying fallback model: {fallback_model}")
         try:
             self._execute_stream(
@@ -201,6 +201,16 @@ class GeminiProvider(BaseProvider):
             pass
         return 1.0
 
+    def _smart_fallback(self, model: str) -> Optional[str]:
+        """Smart fallback based on model name patterns."""
+        if model == "gemini-2.5-flash":
+            return "gemini-2.5-flash-lite"
+        elif model.startswith("gemini-3-"):
+            return "gemini-2.5-flash"
+        elif model.startswith("glm-"):
+            return None  # Z.AI handles its own fallbacks
+        return None
+
     def _execute_stream(
         self,
         model: str,
@@ -214,11 +224,18 @@ class GeminiProvider(BaseProvider):
         headers_dict = req_data.get("_headers") or {}
         subagent = headers_dict.get("x-openai-subagent")
 
-        if subagent in ("compact", "review") and not model.startswith(
-            "gemini-2.5-flash"
-        ):
-            model = "gemini-2.5-flash-lite"
-            logger.info(f"Subagent '{subagent}' detected. Using faster model: {model}")
+        if subagent in ("compact", "review"):
+            subagent_model = config.fallback_models.get(
+                f"subagent:{subagent}",
+                config.compaction_model or config.models[0]
+                if config.models
+                else "gemini-2.5-flash-lite",
+            )
+            if model != subagent_model:
+                model = subagent_model
+                logger.info(
+                    f"Subagent '{subagent}' detected. Using faster model: {model}"
+                )
 
         display_model = display_model or model
 
@@ -284,7 +301,7 @@ class GeminiProvider(BaseProvider):
             data=json_dumps(request_body),
             headers=headers,
             stream=True,
-            timeout=(10, 600),
+            timeout=(config.request_timeout_connect, config.request_timeout_read),
         ) as resp:
             if resp.status_code != 200:
                 raise requests.exceptions.HTTPError(
@@ -352,14 +369,15 @@ class GeminiProvider(BaseProvider):
         model: str,
         system_instruction: Optional[Dict],
     ):
-        """Map reasoning effort to Gemini thinkingConfig."""
-        mapping = {
-            "low": (4096, "LOW"),
-            "medium": (16384, "MEDIUM"),
-            "high": (32768, "HIGH"),
-            "xhigh": (65536, "HIGH"),
-        }
-        budget, level = mapping.get(effort, (16384, "MEDIUM"))
+        """Map reasoning effort to Gemini thinkingConfig using config."""
+        effort_levels = config.reasoning.get("effort_levels", {})
+        default_effort = config.reasoning.get("default_effort", "medium")
+        effort_config = effort_levels.get(
+            effort,
+            effort_levels.get(default_effort, {"budget": 16384, "level": "MEDIUM"}),
+        )
+        budget = effort_config.get("budget", 16384)
+        level = effort_config.get("level", "MEDIUM")
 
         if model.startswith("gemini-3"):
             gen_config["thinkingConfig"] = {

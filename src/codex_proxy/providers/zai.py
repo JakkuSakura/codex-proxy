@@ -1,29 +1,11 @@
 import time
 import logging
 import requests
-import json
 from typing import Dict, Any, List, Optional
 from .base import BaseProvider
-from ..utils import create_session
+from ..utils import create_session, json_loads, json_dumps
 from ..config import config
 from .zai_stream import stream_responses_loop
-
-try:
-    import orjson
-
-    def json_dumps(data: Any) -> bytes:
-        return orjson.dumps(data)
-
-    def json_loads(data: bytes | str) -> Any:
-        return orjson.loads(data)
-except ImportError:
-
-    def json_dumps(data: Any) -> bytes:
-        return json.dumps(data).encode("utf-8")
-
-    def json_loads(data: bytes | str) -> Any:
-        return json.loads(data)
-
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +89,7 @@ class ZAIProvider(BaseProvider):
                 json=payload,
                 headers={"Authorization": auth_header} if auth_header else {},
                 stream=stream,
-                timeout=(10, 600),
+                timeout=(config.request_timeout_connect, config.request_timeout_read),
             ) as resp:
                 if stream:
                     self._handle_stream_response(resp, payload, handler)
@@ -162,7 +144,7 @@ class ZAIProvider(BaseProvider):
                     "type": "function_call",
                     "status": "completed",
                     "name": tc["function"]["name"],
-                    "arguments": json.dumps(tc["function"]["arguments"]),
+                    "arguments": json_dumps(tc["function"]["arguments"]),
                     "call_id": tc.get("id"),
                 }
                 # Parity with Gemini shell mapping
@@ -171,7 +153,7 @@ class ZAIProvider(BaseProvider):
                     try:
                         args = tc["function"]["arguments"]
                         if isinstance(args, str):
-                            args = json.loads(args)
+                            args = json_loads(args)
                         item["action"] = {
                             "type": "exec",
                             "command": args.get("command", []),
@@ -206,3 +188,62 @@ class ZAIProvider(BaseProvider):
             "output": output_items,
         }
         handler.wfile.write(json_dumps(resp_obj))
+
+    def handle_compact(self, data: Dict[str, Any], handler: Any) -> None:
+        """Handle context compaction using configured compaction model."""
+        compaction_model = data.get(
+            "model", config.models[0] if config.models else "glm-4.6"
+        )
+
+        messages = data.get("input", [])
+        compaction_prompt = data.get(
+            "instructions", "Summarize the conversation history concisely."
+        )
+
+        messages.append(
+            {
+                "role": "user",
+                "content": f"Perform context compaction. instructions: {compaction_prompt}",
+            }
+        )
+
+        payload = {
+            "model": compaction_model,
+            "messages": messages,
+            "stream": False,
+            "temperature": config.compaction_temperature,
+            "max_tokens": config.request_timeout_read,
+        }
+
+        auth_header = handler.headers.get("Authorization")
+        if not auth_header and config.z_ai_api_key:
+            auth_header = f"Bearer {config.z_ai_api_key}"
+
+        try:
+            with self.session.post(
+                config.z_ai_url,
+                json=payload,
+                headers={"Authorization": auth_header} if auth_header else {},
+                timeout=(config.request_timeout_connect, config.request_timeout_read),
+            ) as resp:
+                if resp.status_code != 200:
+                    logger.error(f"Compaction request failed: {resp.status_code}")
+                    handler.send_error(resp.status_code, resp.text)
+                    return
+
+                z_data = resp.json()
+                choice = z_data.get("choices", [{}])[0]
+                final_text = choice.get("message", {}).get("content", "")
+
+                result = {
+                    "output": [{"type": "compaction", "encrypted_content": final_text}]
+                }
+
+                handler.send_response(200)
+                handler.send_header("Content-Type", "application/json")
+                handler.end_headers()
+                handler.wfile.write(json_dumps(result))
+
+        except Exception as e:
+            logger.error(f"Compaction failed: {e}")
+            handler.send_error(500, str(e))

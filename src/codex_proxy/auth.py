@@ -112,7 +112,7 @@ class GeminiAuth:
 
     def _refresh_token(self, creds_data: Dict[str, Any], path: str) -> str:
         """Perform OAuth2 refresh flow."""
-        logger.info(f"Refreshing Gemini Access Token from {path}...")
+        logger.info(f"Refreshing access token from {path}")
 
         client_id = creds_data.get("client_id") or config.client_id
         client_secret = creds_data.get("client_secret") or config.client_secret
@@ -197,7 +197,7 @@ class GeminiAuth:
                 self._cached_project_id = pid
                 return pid
 
-            logger.info("Gemini Project ID missing. Attempting onboarding...")
+            logger.info("Project ID missing, starting onboarding")
             tier_id = self._determine_tier(project_info)
             return self._onboard_user(token, tier_id)
 

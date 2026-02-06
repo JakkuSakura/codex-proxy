@@ -1,91 +1,118 @@
 # codex-proxy
 
-A high-performance bridge that maps the OpenAI Responses API used by Codex to other providers like Google Gemini and Z.AI (GLM). It handles the low-level translation, role mapping, and stream formatting so you can use these models as drop-in replacements for GPT-4/5 in your agentic workflows.
+[![CI](https://github.com/cornellsh/codex-proxy/workflows/CI/badge.svg)](https://github.com/cornellsh/codex-proxy/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
+**An OpenAI Responses API proxy for Gemini and Z.AI (GLM) providers.**
+
+Translates OpenAI's Responses API to Gemini and Z.AI APIs. Handles wire format differences, role mapping, and SSE stream formatting so Codex can use these providers instead of GPT.
 
 ## Features
 
-- **Responses API Parity**: Implements the full lifecycle of the Responses API, including metadata-rich events (`response.created`, `response.output_item.added`, etc.).
-- **Provider Compatibility**: Fixes breaking issues, such as mapping the `developer` role back to `system` and sanitizing tool parameters for older APIs.
-- **Advanced Gemini Integration**: Supports Gemini "thinking" blocks, JSON schemas, and automatic fallback to Flash models under rate limits.
-- **Unified Authentication**: Supports every `gemini-cli` authentication type (OAuth, AI Studio API Keys, Vertex AI, ADC).
-- **Context Management**: Dedicated compaction endpoint using fast Flash models to summarize history.
+- **Responses API** - Full lifecycle with SSE events
+- **Multi-Provider** - Gemini (OAuth2) and Z.AI (GLM) support
+- **Context Compaction** - Both Gemini and Z.AI models support
+- **Tool Support** - Function calling and web search
+- **Docker Ready** - Production container with hot-reload
 
-## Getting Started
-
-Manage the proxy using the `scripts/control.sh` script.
+## Quick Start
 
 ```bash
-# Start the proxy in Docker
+# Clone and start
+git clone https://github.com/cornellsh/codex-proxy.git
+cd codex-proxy
+
+# Start proxy (Docker)
 ./scripts/control.sh start
 
-# Monitor logs (Standard Unix format)
-./scripts/control.sh logs
-
-# Run a test command through Codex
-./scripts/control.sh run -p glm -- "Why is the sky blue?"
-
-# Stop the proxy
-./scripts/control.sh stop
+# Or run directly (Python 3.11+ required)
+python -m codex_proxy
 ```
 
 ## Configuration
 
-The proxy loads configuration from environment variables or a JSON file at `~/.config/codex-proxy/config.json`.
+Configuration lives at `~/.config/codex-proxy/config.json`. Environment variables override all settings.
 
-| Variable | Config Key | Description |
-| :--- | :--- | :--- |
-| `PORT` | `port` | Server listen port (default: 8765). |
-| `GEMINI_API_KEY` | `gemini_api_key` | Google AI Studio API Key. |
-| `Z_AI_API_KEY` | `z_ai_api_key` | Z.AI (GLM) API Key. |
-| `GEMINI_MODELS` | `gemini_models` | Comma-separated list of supported Gemini models. |
-| `GOOGLE_CLOUD_PROJECT` | - | Manual override for Google Cloud Project ID. |
+### Server Settings
 
-### Configuration Example (`~/.config/codex-proxy/config.json`)
+| Env Var | Config Key | Description | Default |
+|----------|-------------|-------------|----------|
+| `CODEX_PROXY_PORT` | `port` | Port to listen on | `8765` |
+| `CODEX_PROXY_LOG_LEVEL` | `log_level` | Logging level (DEBUG, INFO, WARNING, ERROR) | `DEBUG` |
+| `CODEX_PROXY_DEBUG` | `debug_mode` | Enable debug mode (logs raw requests) | `true` |
+
+### Authentication Settings
+
+| Env Var | Config Key | Description | Default |
+|----------|-------------|-------------|----------|
+| `CODEX_PROXY_ZAI_API_KEY` | `z_ai_api_key` | Z.AI API key | - |
+| `CODEX_PROXY_GEMINI_API_KEY` | `gemini_api_key` | Google AI Studio API key | - |
+| `CODEX_PROXY_GEMINI_CLIENT_ID` | `client_id` | Override OAuth client ID | Built-in |
+| `CODEX_PROXY_GEMINI_CLIENT_SECRET` | `client_secret` | Override OAuth client secret | Built-in |
+
+### API Endpoints
+
+| Env Var | Config Key | Description | Default |
+|----------|-------------|-------------|----------|
+| `CODEX_PROXY_ZAI_URL` | `z_ai_url` | Z.AI endpoint | `https://api.z.ai/api/coding/paas/v4/chat/completions` |
+| `CODEX_PROXY_GEMINI_API_INTERNAL` | `gemini_api_internal` | Gemini internal API | `https://cloudcode-pa.googleapis.com` |
+| `CODEX_PROXY_GEMINI_API_PUBLIC` | `gemini_api_public` | Gemini public API | `https://generativelanguage.googleapis.com` |
+
+### Model Settings
+
+| Config Key | Description | Default |
+|------------|-------------|----------|
+| `models` | Available models (any model accepted if empty) | `[]` |
+| `compaction_model` | Model for context compaction | First configured model |
+| `fallback_models` | Map model names to fallbacks | `{}` |
+| `model_prefixes` | Map model prefixes to providers | `{"gemini": "gemini", "glm": "zai", "zai": "zai"}` |
+
+### Reasoning Settings
+
+| Config Key | Description | Default |
+|------------|-------------|----------|
+| `reasoning_effort` | Default reasoning effort level | `medium` |
+| `reasoning.effort_levels` | Custom effort levels with budgets | Pre-configured levels |
+
+### Timeout Settings
+
+| Config Key | Description | Default |
+|------------|-------------|----------|
+| `request_timeout_connect` | Connection timeout (seconds) | `10` |
+| `request_timeout_read` | Read timeout (seconds) | `600` |
+| `compaction_temperature` | Temperature for compaction requests | `0.1` |
+
+### Example Config
 
 ```json
 {
   "port": 8765,
-  "gemini_api_key": "your-ai-studio-key",
+  "log_level": "INFO",
   "z_ai_api_key": "your-z-ai-key",
-  "gemini_models": ["gemini-3-flash-preview", "gemini-3-pro-preview"]
+  "gemini_api_key": "your-google-ai-studio-key",
+  "compaction_model": "glm-4.6",
+  "fallback_models": {
+    "gemini-3-pro-preview": "gemini-2.5-flash",
+    "glm-4.7": "glm-4.6"
+  },
+  "reasoning": {
+    "default_effort": "medium"
+  },
+  "model_prefixes": {
+    "custom-model": "gemini"
+  }
 }
 ```
 
-## Authentication (Gemini)
+### Available Reasoning Effort Levels
 
-The proxy is designed to be zero-config. It automatically supports all [gemini-cli authentication methods](https://github.com/google-gemini/gemini-cli/blob/main/docs/get-started/authentication.md):
+`none`, `minimal`, `low`, `medium`, `high`, `xhigh`. You can customize budgets and levels in `reasoning.effort_levels` config if needed.
 
-1.  **Standard Google Login**: Run `gemini login` on your host. The proxy automatically discovers these credentials and handles the OAuth2 refresh flow using the official Gemini CLI client identity.
-2.  **AI Studio (API Key)**: Set `GEMINI_API_KEY`. The proxy will automatically switch to the Google AI public API.
-3.  **Service Accounts**: Set `GOOGLE_APPLICATION_CREDENTIALS` to your JSON key path.
-4.  **Application Default Credentials (ADC)**: Works automatically in GCP environments (GCE, Cloud Shell) or via `gcloud auth application-default login`.
-5.  **Vertex AI**: Works natively if you provide a `GOOGLE_CLOUD_PROJECT` and have authenticated via ADC or Service Account.
+## Documentation
 
-## Connecting to Codex
+- [CONTRIBUTING.md](CONTRIBUTING.md) - Development guide and contribution process
+- [AGENTS.md](AGENTS.md) - Deep technical context for AI assistants
 
-Update your `~/.codex/config.toml` to point to the proxy.
+## License
 
-### Z.AI (GLM)
-```toml
-[model_providers.z_ai]
-name = "ZAI Proxy"
-base_url = "http://localhost:8765"
-env_key = "Z_AI_API_KEY"
-wire_api = "responses"
-
-[profiles.glm]
-model = "glm-4.6"
-model_provider = "z_ai"
-```
-
-### Gemini
-```toml
-[model_providers.gemini_proxy]
-name = "Gemini Proxy"
-base_url = "http://localhost:8765"
-wire_api = "responses"
-
-[profiles.gemini]
-model = "gemini-3-pro-preview"
-model_provider = "gemini_proxy"
-```
+MIT License - see [LICENSE](LICENSE)

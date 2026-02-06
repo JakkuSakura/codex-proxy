@@ -1,18 +1,8 @@
-import json
 import logging
 import os
 from typing import Dict, Any, List, Optional, Tuple
 
-try:
-    import orjson
-
-    def json_loads(data: bytes | str) -> Any:
-        return orjson.loads(data)
-except ImportError:
-
-    def json_loads(data: bytes | str) -> Any:
-        return json.loads(data)
-
+from ..utils import json_loads
 
 logger = logging.getLogger(__name__)
 

@@ -6,16 +6,14 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from typing import Dict, Any, Type, Optional, cast
 
-try:
-    import orjson
-except ImportError:
-    import json as orjson
-
 from .config import config
+from .exceptions import ProxyError, ProviderError, ValidationError, ConfigurationError
 from .providers.base import BaseProvider
 from .providers.gemini import GeminiProvider
 from .providers.zai import ZAIProvider
 from .normalizer import RequestNormalizer
+from .utils import json_loads
+from .validator import RequestValidator
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +35,25 @@ class ProviderRegistry:
         # Default to ZAI if no match
         return cast(BaseProvider, cls._providers.get("zai"))
 
+    @classmethod
+    def initialize_from_config(cls):
+        """Initialize provider registry from configuration."""
+        cls._providers.clear()
+
+        cls.register("gemini", GeminiProvider())
+        cls.register("zai", ZAIProvider())
+
+        for prefix, provider_key in config.model_prefixes.items():
+            if prefix in cls._providers:
+                continue
+            if provider_key == "gemini":
+                cls.register(prefix, GeminiProvider())
+            elif provider_key == "zai":
+                cls.register(prefix, ZAIProvider())
+
 
 # Initialize registry
-ProviderRegistry.register("gemini", GeminiProvider())
-ProviderRegistry.register("zai", ZAIProvider())
-# Default / Catch-all
-ProviderRegistry.register("glm", ZAIProvider())
+ProviderRegistry.initialize_from_config()
 
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -65,12 +76,21 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             self._handle_post()
+        except ValidationError as e:
+            logger.error(f"Validation error: {e}", exc_info=True)
+            self.send_error(400, str(e))
+        except ProviderError as e:
+            logger.error(f"Provider error: {e}", exc_info=True)
+            self.send_error(502, str(e))
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.error(f"Invalid request: {e}", exc_info=True)
+            self.send_error(400, f"Invalid request: {e}")
+        except ProxyError as e:
+            logger.error(f"Proxy error: {e}", exc_info=True)
+            self.send_error(500, str(e))
         except Exception as e:
-            logger.error(f"Handler Error: {e}", exc_info=True)
-            try:
-                self.send_error(500, str(e))
-            except Exception:
-                pass
+            logger.critical(f"Unexpected error: {e}", exc_info=True)
+            self.send_error(500, "Internal server error")
 
     def _handle_post(self):
         logger.info(f"POST {self.path}")
@@ -94,9 +114,12 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             logger.debug(f"RAW REQUEST: {body.decode('utf-8', errors='replace')}")
 
         try:
-            data = orjson.loads(body)
-        except Exception:
-            data = json.loads(body)
+            data = json_loads(body)
+        except (json.JSONDecodeError, ValueError) as e:
+            raise ValidationError(f"Invalid JSON: {e}")
+
+        # Validate request
+        RequestValidator.validate_request(data, self.path)
 
         # Attach context headers
         data["_headers"] = {
@@ -112,12 +135,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             data = RequestNormalizer.normalize(data)
             data["_is_responses_api"] = True
 
-        model = data.get("model", "")
-        provider = ProviderRegistry.get_provider(model)
-
+        # For compaction requests, use configured compaction_model to determine provider
+        # This ensures compaction works regardless of what model the user has selected
         if is_compact:
+            compaction_model = config.compaction_model
+            if not compaction_model:
+                compaction_model = (
+                    config.models[0] if config.models else "gemini-2.5-flash-lite"
+                )
+            provider = ProviderRegistry.get_provider(compaction_model)
             provider.handle_compact(data, self)
         else:
+            model = data.get("model", "")
+            provider = ProviderRegistry.get_provider(model)
             provider.handle_request(data, self)
 
         self.close_connection = True
@@ -137,11 +167,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
 def run_server():
     server_address = (config.host, config.port)
     httpd = ThreadedHTTPServer(server_address, ProxyRequestHandler)
-    logger.info(f"Codex Proxy listening on {config.host}:{config.port}")
+    logger.info(f"Listening on {config.host}:{config.port}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        logger.info("Shutting down server...")
+        logger.info("Shutting down")
         httpd.server_close()
 
 
