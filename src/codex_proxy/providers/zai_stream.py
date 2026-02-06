@@ -138,7 +138,7 @@ class ZAIStreamHandler:
                         args_part = fn_delta["arguments"]
                         if isinstance(args_part, dict):
                             # If they sent an object instead of a string, stringify it
-                            args_part = json.dumps(args_part)
+                            args_part = json_dumps(args_part)
                         tc["arguments"] += args_part
 
             # 2. Handle Content
@@ -204,12 +204,12 @@ class ZAIStreamHandler:
                 if item["name"] in ("shell", "container.exec", "shell_command"):
                     item["type"] = "local_shell_call"
                     try:
-                        args = json.loads(item["arguments"])
+                        args = json_loads(item["arguments"])
                         item["action"] = {
                             "type": "exec",
                             "command": args.get("command", []),
                         }
-                    except:
+                    except (ValueError, TypeError, KeyError):
                         pass
 
             self._send_event(

@@ -3,8 +3,7 @@ import time
 import logging
 import os
 import threading
-import requests
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 
 from .config import config
 from .utils import create_session

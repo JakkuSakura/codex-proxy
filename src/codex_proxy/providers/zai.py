@@ -1,7 +1,7 @@
 import time
 import logging
 import requests
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 from .base import BaseProvider
 from ..utils import create_session, json_loads, json_dumps
 from ..config import config
@@ -158,7 +158,7 @@ class ZAIProvider(BaseProvider):
                             "type": "exec",
                             "command": args.get("command", []),
                         }
-                    except:
+                    except (ValueError, TypeError, KeyError):
                         pass
                 output_items.append(item)
 

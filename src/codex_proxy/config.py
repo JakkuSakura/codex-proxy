@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any, Callable
+from typing import List, Dict, Optional, Any
 from .exceptions import ConfigurationError
 
 # Official gemini-cli credentials
@@ -148,8 +148,9 @@ class Config:
         default_factory=lambda: os.environ.get("CODEX_PROXY_LOG_LEVEL", "DEBUG").upper()
     )
     debug_mode: bool = field(
-        default_factory=lambda: os.environ.get("CODEX_PROXY_DEBUG", "true").lower()
-        == "true"
+        default_factory=lambda: (
+            os.environ.get("CODEX_PROXY_DEBUG", "true").lower() == "true"
+        )
     )
 
     def __post_init__(self):

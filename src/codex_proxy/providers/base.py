@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from http.server import BaseHTTPRequestHandler
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 class BaseProvider(ABC):

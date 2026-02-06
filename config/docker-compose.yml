@@ -1,13 +1,15 @@
 services:
   codex-proxy:
-    build: .
+    build:
+      context: ..
+      dockerfile: config/Dockerfile
     container_name: codex-proxy
     ports:
       - "8765:8765"
     volumes:
       - ${HOME}/.gemini:/home/appuser/.gemini:rw
       - ${HOME}/.config/codex-proxy:/home/appuser/.config/codex-proxy:ro
-      - ./src:/app/src:rw
+      - ../src:/app/src:rw
     restart: unless-stopped
     logging:
       driver: "json-file"

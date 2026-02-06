@@ -1,10 +1,9 @@
 """Input validation for codex-proxy requests."""
 
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 from .exceptions import ValidationError
-from .config import config
 
 logger = logging.getLogger(__name__)
 

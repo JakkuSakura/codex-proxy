@@ -1,7 +1,6 @@
 import json
 import logging
 import sys
-import threading
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry

@@ -2,7 +2,7 @@ import json
 import time
 import logging
 import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 
 try:
     import orjson

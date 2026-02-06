@@ -2,10 +2,10 @@ import json
 import time
 import logging
 import requests
-from typing import Dict, Any, List, Optional, Tuple, cast
+from typing import Dict, Any, Optional
 
 from ..config import config
-from ..auth import GeminiAuth, AuthError
+from ..auth import GeminiAuth
 from ..utils import create_session, json_loads, json_dumps
 from .base import BaseProvider
 from .gemini_utils import map_messages, sanitize_params

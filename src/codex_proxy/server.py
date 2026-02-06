@@ -1,13 +1,12 @@
 import json
 import logging
 import socket
-import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-from typing import Dict, Any, Type, Optional, cast
+from typing import Dict, cast
 
 from .config import config
-from .exceptions import ProxyError, ProviderError, ValidationError, ConfigurationError
+from .exceptions import ProxyError, ProviderError, ValidationError
 from .providers.base import BaseProvider
 from .providers.gemini import GeminiProvider
 from .providers.zai import ZAIProvider

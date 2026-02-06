@@ -32,15 +32,15 @@ shift
 case "$COMMAND" in
     start)
         echo "Starting proxy container..."
-        docker-compose up -d --build
+        docker-compose -f config/docker-compose.yml up -d --build
         ;;
     stop)
         echo "Stopping proxy container..."
-        docker-compose down
+        docker-compose -f config/docker-compose.yml down
         ;;
     logs)
         echo "Following logs..."
-        docker-compose logs -f
+        docker-compose -f config/docker-compose.yml logs -f
         ;;
     test)
         echo "Running tests..."
@@ -76,7 +76,7 @@ case "$COMMAND" in
         done
 
         echo "Rebuilding and restarting proxy..."
-        docker-compose up -d --build
+        docker-compose -f config/docker-compose.yml up -d --build
         echo "Waiting for proxy to be ready..."
         sleep 2
 

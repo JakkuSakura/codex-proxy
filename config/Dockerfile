@@ -6,7 +6,7 @@ RUN useradd -m -u 1000 appuser
 WORKDIR /app
 
 # Install dependencies
-COPY requirements.txt .
+COPY config/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source code
