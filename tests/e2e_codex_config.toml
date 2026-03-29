@@ -1,0 +1,18 @@
+# Dedicated codex config for e2e testing with codex-proxy.
+# The base_url is a template — tests inject the actual port at runtime.
+
+model = "glm-5-turbo"
+model_context_window = 128000
+model_auto_compact_token_limit = 100000
+disable_response_storage = true
+personality = "pragmatic"
+approvals_reviewer = "user"
+# sandbox not enforced here; tests use --dangerously-bypass-approvals-and-sandbox
+ephemeral = true
+
+[model_providers.codex-proxy]
+name = "openai"
+base_url = "http://127.0.0.1:{port}/v1"
+wire_api = "responses"
+api_key = "e2e-test"
+requires_openai_auth = false

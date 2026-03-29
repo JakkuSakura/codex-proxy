@@ -108,7 +108,7 @@ pub fn stream_responses_sse(
 
                         if let Some(tc_entry) = tool_calls.get_mut(&idx) {
                             let tc = &mut tc_entry.0;
-                            if let Some(fn_delta) = delta.get("function") {
+                            if let Some(fn_delta) = tc_delta.get("function") {
                                 if let Some(name) = fn_delta.get("name").and_then(|n| n.as_str()) {
                                     let current = tc.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                                     let obj = tc.as_object_mut().unwrap();

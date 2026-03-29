@@ -156,7 +156,7 @@ impl GeminiProvider {
                 }
             }
         }
-        let result = json!({"output": [{"type": "compaction", "encrypted_content": final_text}]});
+        let result = json!({"summary_text": final_text});
         Ok(axum::Json(result).into_response())
     }
 }

@@ -1,25 +1,33 @@
-.PHONY: help install test lint format check run clean
+.PHONY: help install test lint format check run clean e2e-codex build
 
 help:
 	@echo 'Usage: make [target]'
 	@echo ''
 	@echo 'Targets:'
-	@echo '  install   Install dependencies via uv'
-	@echo '  run       Start the proxy server'
-	@echo '  test      Run the test suite'
-	@echo '  lint      Run ruff and mypy'
-	@echo '  format    Format code with ruff'
-	@echo '  check     Run lint + test'
-	@echo '  clean     Remove build/cache artifacts'
+	@echo '  install     Install dependencies via uv'
+	@echo '  build       Build the Rust proxy binary'
+	@echo '  run         Start the proxy server'
+	@echo '  test        Run the unit/integration test suite'
+	@echo '  e2e-codex   Run e2e tests with codex CLI through the proxy'
+	@echo '  lint        Run ruff and mypy'
+	@echo '  format      Format code with ruff'
+	@echo '  check       Run lint + test'
+	@echo '  clean       Remove build/cache artifacts'
 
 install:
 	uv sync
+
+build:
+	cargo build
 
 run:
 	uv run python -m codex_proxy
 
 test:
 	uv run pytest tests/ -v
+
+e2e-codex: build
+	uv run pytest tests/test_e2e_codex.py -v --timeout=300
 
 lint:
 	uv run ruff check src/ tests/

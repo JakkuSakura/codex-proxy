@@ -70,7 +70,7 @@ impl ZAIProvider { pub fn new() -> Self { Self { client: reqwest::Client::new() 
         if !resp.status().is_success() { let status = resp.status(); let body = resp.text().await.unwrap_or_default(); return Err(ProxyError::Provider(format!("Compaction error ({}): {}", status, body))); }
         let z_data: Value = resp.json().await?;
         let final_text = z_data.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("message")).and_then(|m| m.get("content")).and_then(|c| c.as_str()).unwrap_or("");
-        Ok(axum::Json(json!({"output": [{"type": "compaction", "encrypted_content": final_text}]})).into_response())
+        Ok(axum::Json(json!({"summary_text": final_text})).into_response())
     }
 }
 
