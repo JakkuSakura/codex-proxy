@@ -213,7 +213,7 @@ class ZAIProvider(BaseProvider):
             "messages": messages,
             "stream": False,
             "temperature": config.compaction_temperature,
-            "max_tokens": config.request_timeout_read,
+            "max_tokens": 4096,
         }
 
         auth_header = handler.headers.get("Authorization")

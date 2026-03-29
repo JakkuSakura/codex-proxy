@@ -187,9 +187,10 @@ class Config:
                     if not os.environ.get("CODEX_PROXY_MODELS"):
                         self.models = file_config.get("models", self.models)
 
-                    self.compaction_model = file_config.get(
+                    compaction_model_val = file_config.get(
                         "compaction_model", self.compaction_model
                     )
+                    self.compaction_model = compaction_model_val or None
                     self.fallback_models = file_config.get(
                         "fallback_models", self.fallback_models
                     )

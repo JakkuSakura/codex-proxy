@@ -210,3 +210,8 @@ proxy_config.json
 oauth_creds.json
 secrets.json
 /reference/
+
+
+# Added by cargo
+
+/target
