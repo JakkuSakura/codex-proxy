@@ -1,17 +1,26 @@
 use axum::body::Body;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 use crate::config::CONFIG;
 use crate::error::ProxyError;
 use crate::providers::base::Provider;
+use crate::schema::json_value::JsonValue;
+use crate::schema::openai::{
+    ChatContent, ChatMessage, ChatRequest, CompactRequest, Tool, ToolCall,
+};
+use crate::schema::sse::{
+    FunctionCallItem, LocalShellCallItem, MessageItem, OutputContentPart, OutputItem,
+    ResponseObject, Usage,
+};
 
 pub struct ZAIProvider {
     client: reqwest::Client,
 }
+
 impl Default for ZAIProvider {
     fn default() -> Self {
         Self::new()
@@ -27,26 +36,9 @@ impl ZAIProvider {
 
     async fn execute_request(
         &self,
-        data: &Value,
+        req: &ChatRequest,
         headers: HeaderMap,
     ) -> Result<Response<Body>, ProxyError> {
-        let mut payload = json!({"model": data.get("model"), "messages": data.get("messages").cloned().unwrap_or(json!([])), "stream": data.get("stream").and_then(|s| s.as_bool()).unwrap_or(false)});
-        if let Some(tools) = data.get("tools") {
-            payload["tools"] = tools.clone();
-        }
-        if let Some(tc) = data.get("tool_choice") {
-            payload["tool_choice"] = tc.clone();
-        }
-        if let Some(temp) = data.get("temperature") {
-            payload["temperature"] = temp.clone();
-        }
-        if let Some(top_p) = data.get("top_p") {
-            payload["top_p"] = top_p.clone();
-        }
-        if let Some(max_tokens) = data.get("max_tokens") {
-            payload["max_tokens"] = max_tokens.clone();
-        }
-        transform_payload(&mut payload);
         let auth_header = headers
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
@@ -62,21 +54,21 @@ impl ZAIProvider {
                     .into(),
             ));
         }
-        let stream = payload
-            .get("stream")
-            .and_then(|s| s.as_bool())
-            .unwrap_or(false);
+
+        let zai_req = to_zai_chat_request(req);
         let mut req_builder = self
             .client
             .post(&CONFIG.z_ai_url)
-            .json(&payload)
+            .json(&zai_req)
             .timeout(std::time::Duration::from_secs(CONFIG.request_timeout_read));
-        if let Some(auth) = &auth {
-            req_builder = req_builder.header("Authorization", auth);
+        if let Some(a) = &auth {
+            req_builder = req_builder.header("Authorization", a);
         }
+
         let resp = req_builder.send().await?;
         let status = resp.status();
-        info!("Z.AI response status: {}", resp.status());
+        info!("Z.AI response status: {}", status);
+
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             if status == reqwest::StatusCode::UNAUTHORIZED
@@ -93,30 +85,25 @@ impl ZAIProvider {
             )));
         }
 
-        if stream {
-            self.handle_stream_response(resp, &payload).await
+        if req.stream {
+            self.handle_stream_response(resp, req).await
         } else {
-            self.handle_sync_response(resp, data).await
+            self.handle_sync_response(resp).await
         }
     }
 
     async fn handle_stream_response(
         &self,
         resp: reqwest::Response,
-        payload: &Value,
+        req: &ChatRequest,
     ) -> Result<Response<Body>, ProxyError> {
-        let model = payload
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let model = req.model.clone();
         let created_ts = now_seconds();
-        let metadata = json!({"temperature": payload.get("temperature").and_then(|t| t.as_f64()).unwrap_or(1.0), "top_p": payload.get("top_p").and_then(|t| t.as_f64()).unwrap_or(1.0), "tool_choice": payload.get("tool_choice").and_then(|v| v.as_str()).unwrap_or("auto"), "tools": payload.get("tools").cloned().unwrap_or(json!([])), "store": true, "metadata": json!({})});
         let sse_stream = crate::providers::zai_stream::stream_responses_sse(
             resp.bytes_stream(),
             &model,
             created_ts,
-            &metadata,
+            req,
         );
         let body = Body::from_stream(sse_stream);
         Ok(Response::builder()
@@ -130,28 +117,19 @@ impl ZAIProvider {
     async fn handle_sync_response(
         &self,
         resp: reqwest::Response,
-        original_data: &Value,
     ) -> Result<Response<Body>, ProxyError> {
-        let status = resp.status();
         let body_bytes = resp.bytes().await?;
-        if original_data
-            .get("_is_responses_api")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            && status.is_success()
-        {
-            return Ok(write_mapped_response(&body_bytes).into_response());
-        }
-        Ok(Response::builder()
-            .status(status)
-            .header("Content-Type", "application/json")
-            .body(Body::from(body_bytes))
-            .unwrap())
+        let z_data: ZaiChatResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
+            ProxyError::Provider(format!("Failed to decode Z.AI response JSON: {e}"))
+        })?;
+
+        let out = map_zai_response_to_responses_api(&z_data);
+        Ok(axum::Json(out).into_response())
     }
 
     async fn handle_compact_impl(
         &self,
-        data: &Value,
+        data: &CompactRequest,
         headers: HeaderMap,
     ) -> Result<Response<Body>, ProxyError> {
         let compaction_model = CONFIG.compaction_model.as_deref().unwrap_or_else(|| {
@@ -161,18 +139,82 @@ impl ZAIProvider {
                 .map(|s| s.as_str())
                 .unwrap_or("glm-4.6")
         });
-        let input = data.get("input").cloned().unwrap_or(json!([]));
-        let mut messages = match &input {
-            Value::String(s) => vec![json!({"role": "user", "content": s})],
-            Value::Array(arr) => arr.clone(),
-            _ => vec![],
+
+        let mut messages = match &data.input {
+            crate::schema::openai::ResponsesInput::Text(s) => vec![ZaiMessage {
+                role: "user".into(),
+                content: Some(s.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            crate::schema::openai::ResponsesInput::Items(items) => {
+                let mut req = ChatRequest {
+                    model: compaction_model.to_string(),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    tool_choice: None,
+                    temperature: None,
+                    top_p: None,
+                    max_tokens: None,
+                    stream: false,
+                    store: false,
+                    metadata: Default::default(),
+                    previous_response_id: None,
+                    include: Vec::new(),
+                };
+                // Reuse normalizer semantics for compaction input items.
+                req.messages =
+                    crate::normalizer::normalize(crate::schema::openai::ResponsesRequest {
+                        model: compaction_model.to_string(),
+                        input: Some(crate::schema::openai::ResponsesInput::Items(items.clone())),
+                        instructions: None,
+                        previous_response_id: None,
+                        store: None,
+                        metadata: None,
+                        tools: None,
+                        tool_choice: None,
+                        temperature: None,
+                        top_p: None,
+                        max_tokens: None,
+                        stream: None,
+                        include: None,
+                    })
+                    .messages;
+                req.messages
+                    .into_iter()
+                    .map(|m| to_zai_message(&m))
+                    .collect::<Vec<_>>()
+            }
         };
-        let compaction_prompt = data
-            .get("instructions")
-            .and_then(|i| i.as_str())
-            .unwrap_or("Summarize the conversation history concisely.");
-        messages.push(json!({"role": "user", "content": format!("Perform context compaction. instructions: {compaction_prompt}")}));
-        let payload = json!({"model": compaction_model, "messages": messages, "stream": false, "temperature": CONFIG.compaction_temperature, "max_tokens": 4096});
+
+        let compaction_prompt = instructions_to_text(&data.instructions);
+        let compaction_prompt = if compaction_prompt.is_empty() {
+            "Summarize the conversation history concisely.".to_string()
+        } else {
+            compaction_prompt
+        };
+        messages.push(ZaiMessage {
+            role: "user".into(),
+            content: Some(format!(
+                "Perform context compaction. instructions: {compaction_prompt}"
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+
+        let payload = ZaiChatRequest {
+            model: compaction_model.to_string(),
+            messages,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+            temperature: Some(CONFIG.compaction_temperature),
+            top_p: None,
+            max_tokens: Some(4096),
+        };
+
         let auth_header = headers
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
@@ -188,6 +230,7 @@ impl ZAIProvider {
                     .into(),
             ));
         }
+
         let mut req_builder = self
             .client
             .post(&CONFIG.z_ai_url)
@@ -213,120 +256,327 @@ impl ZAIProvider {
                 status, body
             )));
         }
-        let z_data: Value = resp.json().await?;
+        let z_data: ZaiChatResponse = resp.json().await?;
         let final_text = z_data
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|a| a.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-        Ok(axum::Json(json!({"summary_text": final_text})).into_response())
+            .choices
+            .first()
+            .and_then(|c| c.message.as_ref())
+            .and_then(|m| m.content.as_deref())
+            .unwrap_or("")
+            .to_string();
+        Ok(axum::Json(CompactResponse {
+            summary_text: final_text,
+        })
+        .into_response())
     }
-}
-
-fn transform_payload(payload: &mut Value) {
-    if let Some(messages) = payload.get_mut("messages").and_then(|m| m.as_array_mut()) {
-        for m in messages {
-            if m.get("role").and_then(|r| r.as_str()) == Some("developer") {
-                m["role"] = json!("system");
-            }
-        }
-    }
-    if let Some(tools) = payload.get_mut("tools").and_then(|t| t.as_array()) {
-        let mut transformed = Vec::new();
-        for tool in tools {
-            let ttype = tool.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            match ttype {
-                "function" => {
-                    let mut t = tool.clone();
-                    if let Some(obj) = t.as_object_mut() {
-                        obj.remove("strict");
-                    }
-                    transformed.push(t);
-                }
-                "web_search" => {
-                    transformed.push(json!({"type": "web_search", "web_search": {"enable": true, "search_engine": "search_pro_jina"}}));
-                }
-                _ => {}
-            }
-        }
-        payload["tools"] = json!(transformed);
-    }
-}
-
-fn write_mapped_response(body_bytes: &[u8]) -> Response<Body> {
-    let z_data: Value = serde_json::from_slice(body_bytes).unwrap_or(json!({}));
-    let choice = z_data
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|a| a.first());
-    let message = choice.and_then(|c| c.get("message"));
-    let usage = z_data.get("usage").cloned().unwrap_or(json!({}));
-    let mut output_items: Vec<Value> = Vec::new();
-    if let Some(msg) = message {
-        if let Some(tcs) = msg.get("tool_calls").and_then(|t| t.as_array()) {
-            for tc in tcs {
-                let name = tc
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("");
-                let args = tc
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .cloned()
-                    .unwrap_or(json!({}));
-                let call_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
-                let itype = match name {
-                    "shell" | "container.exec" | "shell_command" => "local_shell_call",
-                    _ => "function_call",
-                };
-                let mut item = json!({"id": call_id, "type": itype, "status": "completed", "name": name, "arguments": serde_json::to_string(&args).unwrap_or_default(), "call_id": call_id});
-                if itype == "local_shell_call" {
-                    let cmd = args.get("command").cloned().unwrap_or(json!([]));
-                    item.as_object_mut()
-                        .unwrap()
-                        .insert("action".into(), json!({"type": "exec", "command": cmd}));
-                }
-                output_items.push(item);
-            }
-        }
-        if let Some(content) = msg.get("content").and_then(|c| c.as_str())
-            && !content.is_empty()
-        {
-            output_items.push(json!({"id": format!("msg_{}", now_ms()), "type": "message", "role": "assistant", "status": "completed", "content": [{"type": "text", "text": content}]}));
-        }
-    }
-    let resp_obj = json!({"id": format!("zai_{}", z_data.get("id").and_then(|i| i.as_str()).unwrap_or("unknown")), "object": "response", "created": z_data.get("created").and_then(|c| c.as_i64()).unwrap_or(0), "model": z_data.get("model").and_then(|m| m.as_str()).unwrap_or("unknown"), "status": "completed",
-        "usage": {"prompt_tokens": usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0), "completion_tokens": usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0), "total_tokens": usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0)}, "output": output_items});
-    axum::Json(resp_obj).into_response()
 }
 
 impl Provider for ZAIProvider {
     fn handle_request(
         &self,
-        data: Value,
+        data: ChatRequest,
         headers: HeaderMap,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
         Box::pin(async move { self.execute_request(&data, headers).await })
     }
+
     fn handle_compact(
         &self,
-        data: Value,
+        data: CompactRequest,
         headers: HeaderMap,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
         Box::pin(async move { self.handle_compact_impl(&data, headers).await })
     }
+
     fn clone_box(&self) -> Box<dyn Provider + Send + Sync> {
         Box::new(ZAIProvider {
             client: self.client.clone(),
         })
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CompactResponse {
+    summary_text: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ZaiChatRequest {
+    model: String,
+    messages: Vec<ZaiMessage>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Tool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ZaiMessage {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+fn to_zai_chat_request(req: &ChatRequest) -> ZaiChatRequest {
+    let tools = if req.tools.is_empty() {
+        None
+    } else {
+        Some(req.tools.iter().cloned().map(transform_tool).collect())
+    };
+    ZaiChatRequest {
+        model: req.model.clone(),
+        messages: req.messages.iter().map(to_zai_message).collect(),
+        stream: req.stream,
+        tools,
+        tool_choice: req.tool_choice.clone(),
+        temperature: req.temperature,
+        top_p: req.top_p,
+        max_tokens: req.max_tokens,
+    }
+}
+
+fn to_zai_message(msg: &ChatMessage) -> ZaiMessage {
+    let role = if msg.role == "developer" {
+        "system".to_string()
+    } else {
+        msg.role.clone()
+    };
+    let content = msg.content.as_ref().map(chat_content_to_string);
+    let tool_calls = if msg.tool_calls.is_empty() {
+        None
+    } else {
+        Some(msg.tool_calls.clone())
+    };
+    ZaiMessage {
+        role,
+        content,
+        tool_calls,
+        tool_call_id: msg.tool_call_id.clone(),
+        name: msg.name.clone(),
+    }
+}
+
+fn chat_content_to_string(c: &ChatContent) -> String {
+    match c {
+        ChatContent::Text(s) => s.clone(),
+        ChatContent::Parts(parts) => parts
+            .iter()
+            .map(|p| p.text.clone().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
+fn instructions_to_text(i: &crate::schema::openai::Instructions) -> String {
+    match i {
+        crate::schema::openai::Instructions::Text(s) => s.clone(),
+        crate::schema::openai::Instructions::Parts(parts) => parts
+            .iter()
+            .map(|p| match p {
+                crate::schema::openai::TextPart::Text(s) => s.clone(),
+                crate::schema::openai::TextPart::Obj { text } => text.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
+fn transform_tool(mut tool: Tool) -> Tool {
+    if tool.tool_type == "function" {
+        tool.strict = None;
+    }
+    if tool.tool_type == "web_search" {
+        tool.web_search = Some(crate::schema::openai::WebSearchConfig {
+            enable: Some(true),
+            search_engine: Some("search_pro_jina".into()),
+        });
+    }
+    tool
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ZaiChatResponse {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    created: Option<i64>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    choices: Vec<ZaiChoice>,
+    #[serde(default)]
+    usage: Option<ZaiUsage>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ZaiChoice {
+    #[serde(default)]
+    message: Option<ZaiChoiceMessage>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ZaiChoiceMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ZaiToolCall>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ZaiToolCall {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<ZaiToolCallFn>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ZaiToolCallFn {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<JsonValue>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ZaiUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    total_tokens: Option<u64>,
+}
+
+fn map_zai_response_to_responses_api(z: &ZaiChatResponse) -> ResponseObject {
+    let created = z.created.unwrap_or(0);
+    let model = z.model.clone().unwrap_or_else(|| "unknown".into());
+    let resp_id = format!("zai_{}", z.id.clone().unwrap_or_else(|| "unknown".into()));
+
+    let mut output: Vec<OutputItem> = Vec::new();
+
+    if let Some(choice) = z.choices.first() {
+        if let Some(msg) = &choice.message {
+            for (idx, tc) in msg.tool_calls.iter().enumerate() {
+                let call_id = tc
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("call_{}_{}", now_ms(), idx));
+                let name = tc
+                    .function
+                    .as_ref()
+                    .and_then(|f| f.name.clone())
+                    .unwrap_or_default();
+                let args = tc
+                    .function
+                    .as_ref()
+                    .and_then(|f| f.arguments.as_ref())
+                    .map(|a| serde_json::to_string(a).unwrap_or_default())
+                    .unwrap_or_else(|| "{}".into());
+
+                let item = if name == "shell" || name == "container.exec" || name == "shell_command"
+                {
+                    let cmd = extract_command_from_args(&args);
+                    OutputItem::LocalShellCall(LocalShellCallItem {
+                        id: call_id.clone(),
+                        status: "completed".into(),
+                        name,
+                        arguments: args,
+                        call_id: call_id.clone(),
+                        action: crate::schema::sse::ShellAction {
+                            action_type: "exec",
+                            command: cmd,
+                        },
+                        thought_signature: None,
+                    })
+                } else {
+                    OutputItem::FunctionCall(FunctionCallItem {
+                        id: call_id.clone(),
+                        status: "completed".into(),
+                        name,
+                        arguments: args,
+                        call_id: call_id.clone(),
+                        thought_signature: None,
+                    })
+                };
+                output.push(item);
+            }
+
+            if let Some(content) = msg.content.as_deref() {
+                if !content.is_empty() {
+                    output.push(OutputItem::Message(MessageItem {
+                        id: format!("msg_{}", now_ms()),
+                        role: "assistant",
+                        status: "completed".into(),
+                        content: vec![OutputContentPart::OutputText {
+                            text: content.to_string(),
+                        }],
+                    }));
+                }
+            }
+        }
+    }
+
+    let usage = z.usage.as_ref().map(|u| {
+        let prompt = u.prompt_tokens.unwrap_or(0);
+        let completion = u.completion_tokens.unwrap_or(0);
+        let total = u.total_tokens.unwrap_or(prompt + completion);
+        Usage {
+            input_tokens: prompt,
+            output_tokens: completion,
+            total_tokens: total,
+            input_tokens_details: None,
+            output_tokens_details: None,
+        }
+    });
+
+    ResponseObject {
+        id: resp_id,
+        object: "response",
+        created_at: created,
+        completed_at: None,
+        model,
+        status: "completed".into(),
+        temperature: 1.0,
+        top_p: 1.0,
+        tool_choice: "auto".into(),
+        tools: Vec::new(),
+        parallel_tool_calls: true,
+        store: false,
+        metadata: Default::default(),
+        output,
+        usage,
+    }
+}
+
+fn extract_command_from_args(args: &str) -> Vec<String> {
+    let parsed: Result<JsonValue, _> = serde_json::from_str(args);
+    match parsed {
+        Ok(JsonValue::Object(map)) => match map.get("command") {
+            Some(JsonValue::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
     }
 }
 
@@ -336,6 +586,7 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
 fn now_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

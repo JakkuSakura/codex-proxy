@@ -1,6 +1,6 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde_json::json;
+use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
@@ -69,13 +69,23 @@ impl IntoResponse for ProxyError {
             ),
         };
 
-        let body = json!({
-            "error": {
-                "code": code,
-                "message": message,
-            }
-        });
+        #[derive(Serialize)]
+        struct ErrorEnvelope {
+            error: ErrorBody,
+        }
 
-        (status, axum::Json(body)).into_response()
+        #[derive(Serialize)]
+        struct ErrorBody {
+            code: &'static str,
+            message: String,
+        }
+
+        (
+            status,
+            axum::Json(ErrorEnvelope {
+                error: ErrorBody { code, message },
+            }),
+        )
+            .into_response()
     }
 }

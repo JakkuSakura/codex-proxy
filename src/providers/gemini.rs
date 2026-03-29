@@ -2,14 +2,19 @@ use axum::body::Body;
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::gemini_utils::{map_messages, sanitize_params};
+use super::gemini_utils::{
+    GeminiContent, GeminiPart, GeminiSystemInstruction, map_messages, sanitize_params,
+};
 use crate::auth::{AuthType, GEMINI_AUTH};
 use crate::config::CONFIG;
 use crate::error::ProxyError;
 use crate::providers::base::Provider;
+use crate::schema::json_value::JsonValue;
+use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
 
 pub struct GeminiProvider {
     client: reqwest::Client,
@@ -31,51 +36,44 @@ impl GeminiProvider {
     async fn execute_stream(
         &self,
         model: &str,
-        req_data: &Value,
+        req_data: &ChatRequest,
         _headers: HeaderMap,
     ) -> Result<Response<Body>, ProxyError> {
         let auth_ctx = GEMINI_AUTH.get_auth_context(false).await?;
-        let (contents, system_instruction) = map_messages(
-            req_data
-                .get("messages")
-                .and_then(|m| m.as_array())
-                .cloned()
-                .unwrap_or_default()
-                .as_slice(),
-            model,
-        );
-        let temperature = req_data
-            .get("temperature")
-            .and_then(|t| t.as_f64())
-            .unwrap_or(1.0);
-        let top_p = req_data
-            .get("top_p")
-            .and_then(|t| t.as_f64())
-            .unwrap_or(1.0);
-        let max_tokens = req_data.get("max_tokens").and_then(|m| m.as_u64());
-        let store = req_data
-            .get("store")
-            .and_then(|s| s.as_bool())
-            .unwrap_or(true);
+
+        let (contents, system_instruction) = map_messages(&req_data.messages, model);
+        let temperature = req_data.temperature.unwrap_or(1.0);
+        let top_p = req_data.top_p.unwrap_or(1.0);
+        let max_tokens = req_data.max_tokens;
         let reasoning_effort = &CONFIG.reasoning_effort;
         let reasoning_cfg = CONFIG.reasoning.effort_levels.get(reasoning_effort);
 
-        let mut gen_config = json!({"temperature": temperature, "topP": top_p});
+        let mut gen_config = GeminiGenerationConfig {
+            temperature,
+            top_p,
+            max_output_tokens: None,
+            thinking_config: None,
+        };
         if let Some(max_t) = max_tokens {
-            gen_config["maxOutputTokens"] = json!(max_t);
+            gen_config.max_output_tokens = Some(max_t);
         }
-        if let Some(rc) = reasoning_cfg
-            && rc.budget > 0
-        {
-            gen_config["thinkingConfig"] =
-                json!({"thinkingBudget": rc.budget, "includeThoughts": true});
+        if let Some(rc) = reasoning_cfg {
+            if rc.budget > 0 {
+                gen_config.thinking_config = Some(GeminiThinkingConfig {
+                    thinking_budget: rc.budget,
+                    include_thoughts: true,
+                });
+            }
         }
 
-        let mut request_body = json!({"contents": contents, "generationConfig": gen_config});
-        if let Some(ref sys_inst) = system_instruction {
-            request_body["systemInstruction"] = sys_inst.clone();
-        }
-        apply_tools(req_data, &mut request_body);
+        let (tools, tool_config) = apply_tools(req_data);
+        let request_body = GeminiRequestBody {
+            contents,
+            generation_config: gen_config,
+            system_instruction,
+            tools,
+            tool_config,
+        };
 
         let (url, req_headers, body_field) = match &auth_ctx.auth_type {
             AuthType::Public => {
@@ -86,7 +84,7 @@ impl GeminiProvider {
                         CONFIG.gemini_api_public
                     ),
                     header::HeaderMap::new(),
-                    "public",
+                    GeminiBodyKind::Public,
                 )
             }
             AuthType::Internal => {
@@ -103,25 +101,38 @@ impl GeminiProvider {
                         CONFIG.gemini_api_internal
                     ),
                     h,
-                    "internal",
+                    GeminiBodyKind::Internal,
                 )
             }
         };
 
-        let actual_body = if body_field == "internal" {
-            json!({"model": model, "project": auth_ctx.project_id, "request": request_body})
-        } else {
-            request_body.clone()
+        let resp = match body_field {
+            GeminiBodyKind::Public => {
+                self.client
+                    .post(&url)
+                    .headers(req_headers)
+                    .json(&request_body)
+                    .timeout(std::time::Duration::from_secs(CONFIG.request_timeout_read))
+                    .send()
+                    .await?
+            }
+            GeminiBodyKind::Internal => {
+                let token_project = auth_ctx.project_id.as_ref().unwrap();
+                let internal = GeminiInternalBody {
+                    model: model.to_string(),
+                    project: token_project.clone(),
+                    request: request_body,
+                };
+                self.client
+                    .post(&url)
+                    .headers(req_headers)
+                    .json(&internal)
+                    .timeout(std::time::Duration::from_secs(CONFIG.request_timeout_read))
+                    .send()
+                    .await?
+            }
         };
 
-        let resp = self
-            .client
-            .post(&url)
-            .headers(req_headers)
-            .json(&actual_body)
-            .timeout(std::time::Duration::from_secs(CONFIG.request_timeout_read))
-            .send()
-            .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -134,12 +145,6 @@ impl GeminiProvider {
         let created_ts = now_seconds();
         let resp_id = format!("resp_{created_ts}");
         let model_owned = model.to_string();
-        let request_metadata = json!({
-            "temperature": temperature, "top_p": top_p,
-            "tool_choice": req_data.get("tool_choice").unwrap_or(&json!("auto")),
-            "tools": req_data.get("tools").unwrap_or(&json!([])),
-            "store": store, "metadata": req_data.get("metadata").unwrap_or(&json!({})),
-        });
 
         let byte_stream = resp.bytes_stream();
         let sse_stream = crate::providers::gemini_stream::stream_responses_sse(
@@ -147,7 +152,7 @@ impl GeminiProvider {
             &resp_id,
             &model_owned,
             created_ts,
-            &request_metadata,
+            req_data,
         );
         let body = Body::from_stream(sse_stream);
         Ok(Response::builder()
@@ -160,7 +165,7 @@ impl GeminiProvider {
 
     async fn handle_compact_impl(
         &self,
-        data: &Value,
+        data: &CompactRequest,
         _headers: HeaderMap,
     ) -> Result<Response<Body>, ProxyError> {
         let auth_ctx = GEMINI_AUTH.get_auth_context(false).await?;
@@ -171,43 +176,73 @@ impl GeminiProvider {
                 .map(|s| s.as_str())
                 .unwrap_or("gemini-2.5-flash-lite")
         });
-        let input = data.get("input").cloned().unwrap_or(json!([]));
-        let input_list = match &input {
-            Value::String(s) => vec![json!({"role": "user", "content": s})],
-            Value::Array(arr) => arr.clone(),
-            _ => vec![],
-        };
-        let (mut contents, system_instruction) = map_messages(&input_list, compaction_model);
-        let compaction_prompt = data
-            .get("instructions")
-            .and_then(|i| i.as_str())
-            .unwrap_or("Summarize the conversation history concisely.");
-        contents.push(json!({"role": "user", "parts": [{"text": format!("Perform context compaction. instructions: {compaction_prompt}")}]}));
-        let gen_config = json!({"temperature": 0.1, "maxOutputTokens": 4096});
 
-        let (url, req_headers, body) = match &auth_ctx.auth_type {
+        let chat_req = crate::normalizer::normalize(ResponsesRequest {
+            model: compaction_model.to_string(),
+            input: Some(data.input.clone()),
+            instructions: None,
+            previous_response_id: None,
+            store: None,
+            metadata: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stream: None,
+            include: None,
+        });
+
+        let (mut contents, system_instruction) = map_messages(&chat_req.messages, compaction_model);
+        let compaction_prompt = instructions_to_text(&data.instructions);
+        let compaction_prompt = if compaction_prompt.is_empty() {
+            "Summarize the conversation history concisely.".to_string()
+        } else {
+            compaction_prompt
+        };
+        contents.push(GeminiContent {
+            role: "user".into(),
+            parts: vec![GeminiPart {
+                text: Some(format!(
+                    "Perform context compaction. instructions: {compaction_prompt}"
+                )),
+                thought: None,
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
+            }],
+        });
+
+        let gen_config = GeminiGenerationConfig {
+            temperature: 0.1,
+            top_p: 1.0,
+            max_output_tokens: Some(4096),
+            thinking_config: None,
+        };
+
+        let body = GeminiRequestBody {
+            contents,
+            generation_config: gen_config,
+            system_instruction,
+            tools: None,
+            tool_config: None,
+        };
+
+        let (url, req_headers, send_body) = match &auth_ctx.auth_type {
             AuthType::Public => {
                 let key = auth_ctx.api_key.as_ref().unwrap();
-                let mut rb = json!({"contents": contents, "generationConfig": gen_config});
-                if let Some(ref sys) = system_instruction {
-                    rb["systemInstruction"] = sys.clone();
-                }
                 (
                     format!(
                         "{}/v1beta/models/{compaction_model}:streamGenerateContent?alt=sse&key={key}",
                         CONFIG.gemini_api_public
                     ),
                     header::HeaderMap::new(),
-                    rb,
+                    GeminiSendBody::Public(body),
                 )
             }
             AuthType::Internal => {
                 let token = auth_ctx.access_token.as_ref().unwrap();
                 let pid = auth_ctx.project_id.as_ref().unwrap();
-                let mut rb = json!({"contents": contents, "generationConfig": gen_config});
-                if let Some(ref sys) = system_instruction {
-                    rb["systemInstruction"] = sys.clone();
-                }
                 let mut h = header::HeaderMap::new();
                 h.insert("Authorization", format!("Bearer {token}").parse().unwrap());
                 (
@@ -216,7 +251,11 @@ impl GeminiProvider {
                         CONFIG.gemini_api_internal
                     ),
                     h,
-                    json!({"model": compaction_model, "project": pid, "request": rb}),
+                    GeminiSendBody::Internal(GeminiInternalBody {
+                        model: compaction_model.to_string(),
+                        project: pid.clone(),
+                        request: body,
+                    }),
                 )
             }
         };
@@ -225,10 +264,11 @@ impl GeminiProvider {
             .client
             .post(&url)
             .headers(req_headers)
-            .json(&body)
+            .json(&send_body)
             .timeout(std::time::Duration::from_secs(60))
             .send()
             .await?;
+
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -248,57 +288,48 @@ impl GeminiProvider {
                     continue;
                 }
                 let data_str = &line[6..];
-                if let Ok(d) = serde_json::from_str::<Value>(data_str) {
-                    let candidates = d
-                        .get("candidates")
-                        .or_else(|| d.get("response").and_then(|r| r.get("candidates")));
-                    if let Some(cands) = candidates.and_then(|c| c.as_array())
-                        && let Some(cand) = cands.first()
-                        && let Some(parts) = cand
-                            .get("content")
-                            .and_then(|c| c.get("parts"))
-                            .and_then(|p| p.as_array())
-                    {
-                        for p in parts {
-                            if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
-                                final_text.push_str(t);
-                            }
-                        }
+                let chunk: GeminiChunk = match serde_json::from_str(data_str) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let resp_part = chunk.response();
+                let cand = match resp_part.candidates.first() {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let parts = match cand.content.as_ref() {
+                    Some(c) => c.parts.as_slice(),
+                    None => continue,
+                };
+                for p in parts {
+                    if let Some(t) = p.text.as_deref() {
+                        final_text.push_str(t);
                     }
                 }
             }
         }
-        let result = json!({"summary_text": final_text});
-        Ok(axum::Json(result).into_response())
+
+        Ok(axum::Json(CompactResponse {
+            summary_text: final_text,
+        })
+        .into_response())
     }
 }
 
 impl Provider for GeminiProvider {
     fn handle_request(
         &self,
-        data: Value,
+        data: ChatRequest,
         headers: HeaderMap,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
-        Box::pin(async move {
-            let model = data
-                .get("model")
-                .and_then(|m| m.as_str())
-                .unwrap_or_else(|| {
-                    CONFIG
-                        .models
-                        .first()
-                        .map(|s| s.as_str())
-                        .unwrap_or("gemini-2.5-flash")
-                });
-            self.execute_stream(model, &data, headers).await
-        })
+        Box::pin(async move { self.execute_stream(&data.model, &data, headers).await })
     }
 
     fn handle_compact(
         &self,
-        data: Value,
+        data: CompactRequest,
         headers: HeaderMap,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
@@ -313,60 +344,191 @@ impl Provider for GeminiProvider {
     }
 }
 
-fn apply_tools(req_data: &Value, target: &mut Value) {
-    let tools = req_data.get("tools").and_then(|t| t.as_array());
-    if let Some(tools) = tools {
-        if tools.is_empty() {
-            return;
+#[derive(Clone, Debug, Serialize)]
+struct CompactResponse {
+    summary_text: String,
+}
+
+#[derive(Clone, Debug)]
+enum GeminiBodyKind {
+    Public,
+    Internal,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GeminiThinkingConfig {
+    #[serde(rename = "thinkingBudget")]
+    thinking_budget: u64,
+    #[serde(rename = "includeThoughts")]
+    include_thoughts: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GeminiGenerationConfig {
+    temperature: f64,
+    #[serde(rename = "topP")]
+    top_p: f64,
+    #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u64>,
+    #[serde(rename = "thinkingConfig", skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<GeminiThinkingConfig>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GeminiFunctionDeclaration {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    parameters: JsonValue,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GeminiTool {
+    #[serde(
+        rename = "functionDeclarations",
+        skip_serializing_if = "Option::is_none"
+    )]
+    function_declarations: Option<Vec<GeminiFunctionDeclaration>>,
+    #[serde(rename = "googleSearch", skip_serializing_if = "Option::is_none")]
+    google_search: Option<GeminiEmptyObject>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GeminiEmptyObject {}
+
+#[derive(Clone, Debug, Serialize)]
+struct GeminiFunctionCallingConfig {
+    mode: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GeminiToolConfig {
+    #[serde(rename = "functionCallingConfig")]
+    function_calling_config: GeminiFunctionCallingConfig,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GeminiRequestBody {
+    contents: Vec<GeminiContent>,
+    #[serde(rename = "generationConfig")]
+    generation_config: GeminiGenerationConfig,
+    #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<GeminiSystemInstruction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<GeminiTool>>,
+    #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
+    tool_config: Option<GeminiToolConfig>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GeminiInternalBody {
+    model: String,
+    project: String,
+    request: GeminiRequestBody,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+enum GeminiSendBody {
+    Public(GeminiRequestBody),
+    Internal(GeminiInternalBody),
+}
+
+fn apply_tools(req_data: &ChatRequest) -> (Option<Vec<GeminiTool>>, Option<GeminiToolConfig>) {
+    let mut tool_decls: Vec<GeminiFunctionDeclaration> = Vec::new();
+    for t in &req_data.tools {
+        if t.tool_type != "function" {
+            continue;
         }
-        let mut tool_decls = Vec::new();
-        for t in tools {
-            let f = if t.get("type").and_then(|v| v.as_str()) == Some("function") {
-                t.get("function")
-            } else if t.get("name").is_some() {
-                Some(t)
-            } else {
-                None
-            };
-            if let Some(func) = f {
-                let params = func.get("parameters").cloned().unwrap_or(json!({}));
-                tool_decls.push(json!({"name": func.get("name"), "description": func.get("description").unwrap_or(&Value::Null), "parameters": sanitize_params(&params)}));
-            }
-        }
-        if !tool_decls.is_empty() {
-            if target.get("tools").is_none() {
-                target
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("tools".into(), json!([]));
-            }
-            if let Some(arr) = target.get_mut("tools").and_then(|v| v.as_array_mut()) {
-                arr.push(json!({"functionDeclarations": tool_decls}));
-            }
-            let tc = req_data
-                .get("tool_choice")
-                .and_then(|t| t.as_str())
-                .unwrap_or("auto");
-            let mode = match tc {
-                "none" => "NONE",
-                _ => "ANY",
-            };
-            target["toolConfig"] = json!({"functionCallingConfig": {"mode": mode}});
-        }
-        if let Some(include) = req_data.get("include").and_then(|i| i.as_array())
-            && include.iter().any(|v| v.as_str() == Some("search"))
-        {
-            if target.get("tools").is_none() {
-                target
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("tools".into(), json!([]));
-            }
-            if let Some(arr) = target.get_mut("tools").and_then(|v| v.as_array_mut()) {
-                arr.push(json!({"googleSearch": {}}));
-            }
+        let func = match &t.function {
+            Some(f) => f,
+            None => continue,
+        };
+        let params = func
+            .parameters
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| JsonValue::Object(Default::default()));
+        tool_decls.push(GeminiFunctionDeclaration {
+            name: func.name.clone(),
+            description: func.description.clone(),
+            parameters: sanitize_params(&params),
+        });
+    }
+
+    let mut tools: Vec<GeminiTool> = Vec::new();
+    if !tool_decls.is_empty() {
+        tools.push(GeminiTool {
+            function_declarations: Some(tool_decls),
+            google_search: None,
+        });
+    }
+
+    if req_data.include.iter().any(|v| v == "search") {
+        tools.push(GeminiTool {
+            function_declarations: None,
+            google_search: Some(GeminiEmptyObject {}),
+        });
+    }
+
+    let tools_opt = if tools.is_empty() { None } else { Some(tools) };
+
+    let tc = req_data.tool_choice.as_deref().unwrap_or("auto");
+    let mode = match tc {
+        "none" => "NONE",
+        _ => "ANY",
+    };
+    let tool_config = if tools_opt.is_some() {
+        Some(GeminiToolConfig {
+            function_calling_config: GeminiFunctionCallingConfig {
+                mode: mode.to_string(),
+            },
+        })
+    } else {
+        None
+    };
+
+    (tools_opt, tool_config)
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum GeminiChunk {
+    Wrapped { response: GeminiResponse },
+    Direct(GeminiResponse),
+}
+
+impl GeminiChunk {
+    fn response(&self) -> &GeminiResponse {
+        match self {
+            GeminiChunk::Wrapped { response } => response,
+            GeminiChunk::Direct(r) => r,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GeminiResponse {
+    #[serde(default)]
+    candidates: Vec<GeminiCandidate>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GeminiCandidate {
+    #[serde(default)]
+    content: Option<GeminiCandidateContent>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GeminiCandidateContent {
+    #[serde(default)]
+    parts: Vec<GeminiPartResp>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GeminiPartResp {
+    #[serde(default)]
+    text: Option<String>,
 }
 
 fn now_seconds() -> i64 {
@@ -374,4 +536,18 @@ fn now_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn instructions_to_text(i: &crate::schema::openai::Instructions) -> String {
+    match i {
+        crate::schema::openai::Instructions::Text(s) => s.clone(),
+        crate::schema::openai::Instructions::Parts(parts) => parts
+            .iter()
+            .map(|p| match p {
+                crate::schema::openai::TextPart::Text(s) => s.clone(),
+                crate::schema::openai::TextPart::Obj { text } => text.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    }
 }

@@ -1,4 +1,5 @@
 use crate::config::CONFIG;
+use crate::schema::json_value::JsonValue;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -33,6 +34,88 @@ struct OAuthCreds {
     refresh_token: Option<String>,
     client_id: Option<String>,
     client_secret: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthRefreshResponse {
+    access_token: Option<String>,
+    expires_in: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataTokenResponse {
+    access_token: Option<String>,
+    expires_in: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct GeminiMetadata {
+    #[serde(rename = "ideType")]
+    ide_type: &'static str,
+    platform: &'static str,
+    #[serde(rename = "pluginType")]
+    plugin_type: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct LoadCodeAssistRequest {
+    metadata: GeminiMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoadCodeAssistResponse {
+    #[serde(rename = "allowedTiers", default)]
+    allowed_tiers: Vec<AllowedTier>,
+    #[serde(rename = "cloudaicompanionProject", default)]
+    cloudaicompanion_project: Option<ProjectField>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AllowedTier {
+    id: String,
+    #[serde(rename = "isDefault", default)]
+    is_default: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ProjectField {
+    Id(String),
+    Obj(ProjectObj),
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectObj {
+    #[serde(default)]
+    id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OnboardUserRequest<'a> {
+    #[serde(rename = "tierId")]
+    tier_id: &'a str,
+    metadata: GeminiMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+struct OnboardUserOperation {
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PollOperationResponse {
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    error: Option<JsonValue>,
+    #[serde(default)]
+    response: Option<PollOperationSuccess>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PollOperationSuccess {
+    #[serde(rename = "cloudaicompanionProject", default)]
+    cloudaicompanion_project: Option<ProjectObj>,
 }
 
 struct TokenCache {
@@ -202,14 +285,11 @@ impl GeminiAuth {
                 status, body
             )));
         }
-        let new_tokens: serde_json::Value = resp.json().await?;
-        let access_token = new_tokens["access_token"]
-            .as_str()
-            .ok_or_else(|| {
-                crate::error::ProxyError::Auth("No access_token in refresh response".into())
-            })?
-            .to_string();
-        let expires_in = new_tokens["expires_in"].as_u64().unwrap_or(3600);
+        let new_tokens: OAuthRefreshResponse = resp.json().await?;
+        let access_token = new_tokens.access_token.ok_or_else(|| {
+            crate::error::ProxyError::Auth("No access_token in refresh response".into())
+        })?;
+        let expires_in = new_tokens.expires_in.unwrap_or(3600);
         let expiry_ms = now_ms() + expires_in * 1000;
         let mut cache = self.cache.lock().unwrap();
         *cache = Some(TokenCache {
@@ -217,16 +297,18 @@ impl GeminiAuth {
             expiry_ms,
         });
         if let Ok(content) = fs::read_to_string(path)
-            && let Ok(mut data) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Ok(mut data) = serde_json::from_str::<OAuthCreds>(&content)
         {
-            data["access_token"] = serde_json::Value::String(access_token.clone());
-            data["expiry_date"] = serde_json::Value::Number(expiry_ms.into());
-            if let Err(e) = fs::write(path, serde_json::to_string_pretty(&data).unwrap()) {
-                warn!(
-                    "Could not save refreshed tokens to {}: {}",
-                    path.display(),
-                    e
-                );
+            data.access_token = Some(access_token.clone());
+            data.expiry_date = Some(expiry_ms);
+            if let Ok(s) = serde_json::to_string_pretty(&data) {
+                if let Err(e) = fs::write(path, s) {
+                    warn!(
+                        "Could not save refreshed tokens to {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
             }
         }
         Ok(access_token)
@@ -237,15 +319,15 @@ impl GeminiAuth {
             .header("Metadata-Flavor", "Google").timeout(std::time::Duration::from_secs(2)).send().await;
         match resp {
             Ok(r) if r.status().is_success() => {
-                let data: serde_json::Value = r.json().await?;
-                if let Some(token) = data["access_token"].as_str() {
-                    let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
+                let data: MetadataTokenResponse = r.json().await?;
+                if let Some(token) = data.access_token {
+                    let expires_in = data.expires_in.unwrap_or(3600);
                     let mut cache = self.cache.lock().unwrap();
                     *cache = Some(TokenCache {
-                        token: token.to_string(),
+                        token: token.clone(),
                         expiry_ms: now_ms() + expires_in * 1000,
                     });
-                    return Ok(Some(token.to_string()));
+                    return Ok(Some(token));
                 }
             }
             _ => {}
@@ -265,13 +347,11 @@ impl GeminiAuth {
             return Ok(pid);
         }
         let project_info = self.fetch_project_info(token).await?;
-        let pid = project_info.get("cloudaicompanionProject").and_then(|v| {
-            if v.is_string() {
-                v.as_str().map(String::from)
-            } else {
-                v.get("id").and_then(|id| id.as_str().map(String::from))
-            }
-        });
+        let pid = match &project_info.cloudaicompanion_project {
+            Some(ProjectField::Id(s)) => Some(s.clone()),
+            Some(ProjectField::Obj(o)) => o.id.clone(),
+            None => None,
+        };
         if let Some(pid) = pid {
             *self.project_id_cache.lock().unwrap() = Some(pid.clone());
             return Ok(pid);
@@ -285,14 +365,17 @@ impl GeminiAuth {
     async fn fetch_project_info(
         &self,
         token: &str,
-    ) -> Result<serde_json::Value, crate::error::ProxyError> {
+    ) -> Result<LoadCodeAssistResponse, crate::error::ProxyError> {
         let url = format!("{}/v1internal:loadCodeAssist", CONFIG.gemini_api_internal);
+        let body = LoadCodeAssistRequest {
+            metadata: default_metadata(),
+        };
         let resp = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .header("User-Agent", "GeminiCLI/0.26.0 (linux; x64)")
-            .json(&serde_json::json!({"metadata": default_metadata()}))
+            .json(&body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?
@@ -306,37 +389,40 @@ impl GeminiAuth {
         tier_id: &str,
     ) -> Result<String, crate::error::ProxyError> {
         let url = format!("{}/v1internal:onboardUser", CONFIG.gemini_api_internal);
+        let body = OnboardUserRequest {
+            tier_id,
+            metadata: default_metadata(),
+        };
         let resp = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .header("User-Agent", "GeminiCLI/0.26.0 (linux; x64)")
-            .json(&serde_json::json!({"tierId": tier_id, "metadata": default_metadata()}))
+            .json(&body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await?
             .error_for_status()?;
-        let operation: serde_json::Value = resp.json().await?;
-        let op_name = operation["name"].as_str().ok_or_else(|| {
+        let operation: OnboardUserOperation = resp.json().await?;
+        let op_name = operation.name.as_deref().ok_or_else(|| {
             crate::error::ProxyError::Auth("Onboarding failed: no operation name".into())
         })?;
         let result = self.poll_operation(token, op_name).await?;
         let pid = result
-            .get("response")
-            .and_then(|r| r.get("cloudaicompanionProject"))
-            .and_then(|p| p.get("id"))
-            .and_then(|id| id.as_str())
+            .response
+            .and_then(|r| r.cloudaicompanion_project)
+            .and_then(|p| p.id)
             .ok_or_else(|| {
                 crate::error::ProxyError::Auth("Onboarding finished but no Project ID found".into())
             })?;
-        Ok(pid.to_string())
+        Ok(pid)
     }
 
     async fn poll_operation(
         &self,
         token: &str,
         op_name: &str,
-    ) -> Result<serde_json::Value, crate::error::ProxyError> {
+    ) -> Result<PollOperationResponse, crate::error::ProxyError> {
         let url = format!("{}/v1internal/{}", CONFIG.gemini_api_internal, op_name);
         let start = std::time::Instant::now();
         loop {
@@ -351,12 +437,12 @@ impl GeminiAuth {
                 .send()
                 .await?
                 .error_for_status()?;
-            let data: serde_json::Value = resp.json().await?;
-            if data["done"].as_bool() == Some(true) {
-                if data.get("error").is_some() {
+            let data: PollOperationResponse = resp.json().await?;
+            if data.done {
+                if let Some(err) = &data.error {
                     return Err(crate::error::ProxyError::Auth(format!(
                         "Operation failed: {}",
-                        data["error"]
+                        serde_json::to_string(err).unwrap_or_default()
                     )));
                 }
                 return Ok(data);
@@ -366,19 +452,21 @@ impl GeminiAuth {
     }
 }
 
-fn determine_tier(project_info: &serde_json::Value) -> String {
-    if let Some(tiers) = project_info.get("allowedTiers").and_then(|t| t.as_array()) {
-        for tier in tiers {
-            if tier["isDefault"].as_bool() == Some(true) {
-                return tier["id"].as_str().unwrap_or("free-tier").to_string();
-            }
+fn determine_tier(project_info: &LoadCodeAssistResponse) -> String {
+    for tier in &project_info.allowed_tiers {
+        if tier.is_default {
+            return tier.id.clone();
         }
     }
     "free-tier".into()
 }
 
-fn default_metadata() -> serde_json::Value {
-    serde_json::json!({"ideType": "IDE_UNSPECIFIED", "platform": "PLATFORM_UNSPECIFIED", "pluginType": "GEMINI"})
+fn default_metadata() -> GeminiMetadata {
+    GeminiMetadata {
+        ide_type: "IDE_UNSPECIFIED",
+        platform: "PLATFORM_UNSPECIFIED",
+        plugin_type: "GEMINI",
+    }
 }
 
 fn is_token_valid(expiry_ms: u64) -> bool {

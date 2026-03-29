@@ -3,7 +3,6 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde_json::{Value, json};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
@@ -11,6 +10,7 @@ use crate::config::CONFIG;
 use crate::error::ProxyError;
 use crate::normalizer;
 use crate::providers;
+use crate::schema::openai::{CompactRequest, ResponsesRequest};
 use crate::ui;
 use crate::validator;
 
@@ -38,38 +38,28 @@ async fn ui_handler() -> Response<Body> {
 }
 
 async fn config_post_handler(
-    Json(_data): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    Json(_data): Json<ui::UiConfigUpdate>,
+) -> Result<Json<ui::UiConfig>, (StatusCode, Json<ui::UiConfig>)> {
     // Config save is a stub for now — returns current config
     Ok(Json(ui::get_current_config()))
 }
 
 async fn responses_handler(
     headers: HeaderMap,
-    Json(mut data): Json<Value>,
+    Json(data): Json<ResponsesRequest>,
 ) -> Result<Response<Body>, ProxyError> {
-    validator::validate_request(&data, "/v1/responses")?;
+    validator::validate_responses_request(&data)?;
 
-    data["_headers"] = json!({
-        "session_id": headers.get("session_id").and_then(|v| v.to_str().ok()).unwrap_or(""),
-        "x-openai-subagent": headers.get("x-openai-subagent").and_then(|v| v.to_str().ok()).unwrap_or(""),
-        "x-codex-turn-state": headers.get("x-codex-turn-state").and_then(|v| v.to_str().ok()).unwrap_or(""),
-        "x-codex-personality": headers.get("x-codex-personality").and_then(|v| v.to_str().ok()).unwrap_or(""),
-    });
-
-    normalizer::normalize(&mut data);
-    data["_is_responses_api"] = json!(true);
-
-    let model = data.get("model").and_then(|m| m.as_str()).unwrap_or("");
-    let provider = providers::get_provider(model);
-    provider.handle_request(data, headers).await
+    let chat_req = normalizer::normalize(data);
+    let provider = providers::get_provider(&chat_req.model);
+    provider.handle_request(chat_req, headers).await
 }
 
 async fn compact_handler(
     headers: HeaderMap,
-    Json(data): Json<Value>,
+    Json(data): Json<CompactRequest>,
 ) -> Result<Response<Body>, ProxyError> {
-    validator::validate_request(&data, "/v1/responses/compact")?;
+    validator::validate_compact_request(&data)?;
 
     let compaction_model = CONFIG.compaction_model.as_deref().unwrap_or_else(|| {
         CONFIG

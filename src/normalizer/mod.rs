@@ -1,67 +1,92 @@
-use serde_json::{Value, json};
+use crate::schema::json_value::JsonValue;
+use crate::schema::openai::{
+    ChatContent, ChatMessage, ChatRequest, Content, InputItem, Instructions, ResponsesInput,
+    ResponsesRequest, TextPart, Tool, ToolCall, ToolCallFunction,
+};
 
-pub fn normalize(data: &mut Value) {
-    let mut messages = Vec::new();
+pub fn normalize(req: ResponsesRequest) -> ChatRequest {
+    let mut messages: Vec<ChatMessage> = Vec::new();
 
-    if let Some(instructions) = data.get("instructions") {
-        let content = extract_text(instructions);
+    if let Some(instructions) = &req.instructions {
+        let content = instructions_text(instructions);
         if !content.is_empty() {
-            messages.push(json!({"role": "system", "content": content}));
+            messages.push(ChatMessage {
+                role: "system".into(),
+                content: Some(ChatContent::Text(content)),
+                reasoning_content: None,
+                thought_signature: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+            });
         }
     }
 
-    if let Some(input) = data.get("input") {
-        let items = match input {
-            Value::String(s) => vec![json!(s)],
-            Value::Array(arr) => arr.clone(),
-            _ => Vec::new(),
-        };
-        for item in &items {
-            process_input_item(item, &mut messages);
+    if let Some(input) = &req.input {
+        match input {
+            ResponsesInput::Text(s) => {
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: Some(ChatContent::Text(s.clone())),
+                    reasoning_content: None,
+                    thought_signature: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
+            ResponsesInput::Items(items) => {
+                for item in items {
+                    process_input_item(item, &mut messages);
+                }
+            }
         }
     }
 
-    data["messages"] = Value::Array(messages);
-    if data.get("previous_response_id").is_none() {
-        data["previous_response_id"] = Value::Null;
-    }
-    if data.get("store").is_none() {
-        data["store"] = Value::Bool(false);
-    }
-    if data.get("metadata").is_none() {
-        data["metadata"] = json!({});
-    }
+    let tools = req
+        .tools
+        .unwrap_or_default()
+        .into_iter()
+        .map(normalize_tool)
+        .collect::<Vec<_>>();
 
-    if let Some(tools) = data.get("tools").and_then(|t| t.as_array()) {
-        data["tools"] = Value::Array(normalize_tools(tools));
+    ChatRequest {
+        model: req.model,
+        messages,
+        tools,
+        tool_choice: req.tool_choice,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        max_tokens: req.max_tokens,
+        stream: req.stream.unwrap_or(false),
+        store: req.store.unwrap_or(false),
+        metadata: req.metadata.unwrap_or_default(),
+        previous_response_id: req.previous_response_id,
+        include: req.include.unwrap_or_default(),
     }
 }
 
-fn extract_text(val: &Value) -> String {
-    match val {
-        Value::String(s) => s.clone(),
-        Value::Array(arr) => arr
+fn instructions_text(i: &Instructions) -> String {
+    match i {
+        Instructions::Text(s) => s.clone(),
+        Instructions::Parts(parts) => parts
             .iter()
-            .map(|item| match item {
-                Value::String(s) => s.clone(),
-                Value::Object(obj) => obj
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                _ => String::new(),
+            .map(|p| match p {
+                TextPart::Text(s) => s.clone(),
+                TextPart::Obj { text } => text.clone(),
             })
             .collect::<Vec<_>>()
             .join(""),
-        _ => String::new(),
     }
 }
 
-fn process_input_item(item: &Value, messages: &mut Vec<Value>) {
-    let item_type = item
-        .get("type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("message");
+fn process_input_item(item: &InputItem, messages: &mut Vec<ChatMessage>) {
+    let item_type = if item.item_type.is_empty() {
+        "message"
+    } else {
+        item.item_type.as_str()
+    };
+
     match item_type {
         "message" | "agentMessage" => process_message(item, messages),
         "reasoning" => process_reasoning(item, messages),
@@ -75,243 +100,249 @@ fn process_input_item(item: &Value, messages: &mut Vec<Value>) {
     }
 }
 
-fn process_message(item: &Value, messages: &mut Vec<Value>) {
-    let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+fn process_message(item: &InputItem, messages: &mut Vec<ChatMessage>) {
+    let role = item.role.as_deref().unwrap_or("user");
     let role = if role == "developer" { "system" } else { role };
-    let content_raw = item.get("content");
-    let reasoning_content = item
-        .get("reasoning_content")
-        .and_then(|r| r.as_str())
-        .unwrap_or("");
-    let content = extract_content_text(content_raw);
+    let reasoning_content = item.reasoning_content.clone().filter(|s| !s.is_empty());
+    let content = extract_content_text(item.content.as_ref());
 
     if role == "assistant" || role == "model" {
         let idx = ensure_last_assistant(messages);
-        let amsg = &mut messages[idx];
-        let obj = amsg.as_object_mut().unwrap();
-        let current_content = obj.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        obj.insert(
-            "content".into(),
-            Value::String(format!("{current_content}{content}")),
-        );
-        if !reasoning_content.is_empty() {
-            let current_rc = obj
-                .get("reasoning_content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("");
-            obj.insert(
-                "reasoning_content".into(),
-                Value::String(format!("{current_rc}{reasoning_content}")),
-            );
+        let msg = &mut messages[idx];
+        let current_content = chat_content_to_string(msg.content.as_ref());
+        let merged = format!("{current_content}{content}");
+        msg.content = Some(ChatContent::Text(merged));
+
+        if let Some(rc) = reasoning_content {
+            let current_rc = msg.reasoning_content.clone().unwrap_or_default();
+            msg.reasoning_content = Some(format!("{current_rc}{rc}"));
         }
-        if let Some(sig) = item.get("thought_signature").and_then(|s| s.as_str()) {
-            obj.insert("thought_signature".into(), Value::String(sig.into()));
+        if let Some(sig) = item.thought_signature.clone() {
+            msg.thought_signature = Some(sig);
         }
-    } else {
-        messages.push(json!({"role": role, "content": content}));
+        return;
     }
+
+    messages.push(ChatMessage {
+        role: role.to_string(),
+        content: Some(ChatContent::Text(content)),
+        reasoning_content,
+        thought_signature: item.thought_signature.clone(),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        name: None,
+    });
 }
 
-fn process_reasoning(item: &Value, messages: &mut Vec<Value>) {
-    let content_list = item.get("content").and_then(|c| c.as_array());
-    let content = content_list
-        .map(|arr| {
-            arr.iter()
-                .map(|cp| match cp {
-                    Value::String(s) => s.clone(),
-                    Value::Object(obj) => obj
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    _ => String::new(),
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .unwrap_or_default();
+fn process_reasoning(item: &InputItem, messages: &mut Vec<ChatMessage>) {
+    let content = extract_content_text(item.content.as_ref());
+    if content.is_empty() {
+        return;
+    }
 
     let idx = ensure_last_assistant(messages);
-    let amsg = &mut messages[idx];
-    let obj = amsg.as_object_mut().unwrap();
-    let current = obj
-        .get("reasoning_content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-    obj.insert(
-        "reasoning_content".into(),
-        Value::String(format!("{current}{content}")),
-    );
-    if let Some(sig) = item.get("thought_signature").and_then(|s| s.as_str()) {
-        obj.insert("thought_signature".into(), Value::String(sig.into()));
+    let msg = &mut messages[idx];
+    let current_rc = msg.reasoning_content.clone().unwrap_or_default();
+    msg.reasoning_content = Some(format!("{current_rc}{content}"));
+    if let Some(sig) = item.thought_signature.clone() {
+        msg.thought_signature = Some(sig);
     }
 }
 
-fn process_tool_call(item: &Value, messages: &mut Vec<Value>) {
+fn process_tool_call(item: &InputItem, messages: &mut Vec<ChatMessage>) {
     let call_id = item
-        .get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("call_unknown");
-    let item_type = item
-        .get("type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("function_call");
-    let name = item
-        .get("name")
-        .and_then(|n| n.as_str())
-        .map(|n| match item_type {
+        .call_id
+        .as_deref()
+        .or(item.id.as_deref())
+        .unwrap_or("call_unknown")
+        .to_string();
+
+    let item_type = if item.item_type.is_empty() {
+        "function_call"
+    } else {
+        item.item_type.as_str()
+    };
+
+    let name = match item.name.as_deref() {
+        Some(n) => match item_type {
             "commandExecution" => "run_shell_command",
             "local_shell_call" => "local_shell_command",
             "fileChange" => "write_file",
             "web_search_call" => "web_search",
             _ => n,
-        })
-        .or_else(|| item.get("name").and_then(|n| n.as_str()))
-        .unwrap_or("unknown");
-
-    let mut args = item
-        .get("arguments")
-        .or_else(|| item.get("input"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    if args.is_null() && item_type == "web_search_call" {
-        args = item.get("action").cloned().unwrap_or(json!({}));
-    }
-    if args.is_null() {
-        match item_type {
-            "commandExecution" => {
-                args = json!({"command": item.get("command").and_then(|c| c.as_str()).unwrap_or(""), "dir_path": item.get("cwd").and_then(|c| c.as_str()).unwrap_or(".")});
-            }
-            "local_shell_call" => {
-                let action = item.get("action").and_then(|a| a.get("exec"));
-                args = json!({"command": action.and_then(|e| e.get("command")).cloned().unwrap_or(json!([])), "working_directory": action.and_then(|e| e.get("working_directory"))});
-            }
-            "fileChange" => {
-                let changes = item.get("changes").and_then(|c| c.as_array());
-                let path = changes
-                    .and_then(|arr| arr.first())
-                    .and_then(|c| c.get("path"))
-                    .and_then(|p| p.as_str())
-                    .unwrap_or("unknown");
-                args = json!({"file_path": path});
-            }
-            _ => {}
         }
-    }
-    let args_str = if args.is_string() {
-        args.as_str().unwrap().to_string()
-    } else {
-        serde_json::to_string(&args).unwrap_or_default()
+        .to_string(),
+        None => "unknown".to_string(),
     };
+
+    let args = item
+        .arguments
+        .as_ref()
+        .or(item.input.as_ref())
+        .or(item.action.as_ref());
+
+    let args_str = args_to_json_string(args, item_type, item);
 
     let idx = ensure_last_assistant(messages);
-    let amsg = &mut messages[idx];
-    let obj = amsg.as_object_mut().unwrap();
-    let tool_calls = obj.entry("tool_calls").or_insert_with(|| json!([]));
-    if let Some(arr) = tool_calls.as_array_mut() {
-        arr.push(json!({"id": call_id, "type": "function", "function": {"name": name, "arguments": args_str}}));
+    let msg = &mut messages[idx];
+    msg.tool_calls.push(ToolCall {
+        id: call_id.clone(),
+        call_type: "function".into(),
+        function: ToolCallFunction {
+            name,
+            arguments: args_str,
+        },
+    });
+
+    if msg.thought_signature.is_none() {
+        msg.thought_signature = item.thought_signature.clone();
     }
-    if let Some(sig) = item.get("thought_signature") {
-        obj.insert(
-            "thought_signature".into(),
-            Value::String(sig.as_str().unwrap_or("").into()),
-        );
-    }
-    if let Some(thought) = item.get("thought").and_then(|t| t.as_str()) {
-        let current = obj
-            .get("reasoning_content")
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
-        obj.insert(
-            "reasoning_content".into(),
-            Value::String(format!("{current}{thought}")),
-        );
+    if let Some(thought) = item.thought.clone() {
+        let current_rc = msg.reasoning_content.clone().unwrap_or_default();
+        msg.reasoning_content = Some(format!("{current_rc}{thought}"));
     }
 }
 
-fn process_tool_output(item: &Value, messages: &mut Vec<Value>) {
-    let call_id = item
-        .get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("call_unknown");
-    let output_raw = item
-        .get("output")
-        .or_else(|| item.get("content"))
-        .or_else(|| item.get("stdout"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let content = match &output_raw {
-        Value::String(s) => s.clone(),
-        Value::Object(obj) => obj
-            .get("content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string(),
-        Value::Array(arr) => arr
-            .iter()
-            .filter_map(|part| {
-                let ptype = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if ptype == "input_text" || ptype == "text" {
-                    part.get("text").and_then(|t| t.as_str()).map(String::from)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    };
-    let content = if content.is_empty() {
-        if let Some(stderr) = item.get("stderr").and_then(|s| s.as_str()) {
-            format!("Error: {stderr}")
-        } else {
-            String::new()
+fn args_to_json_string(args: Option<&JsonValue>, item_type: &str, item: &InputItem) -> String {
+    if let Some(JsonValue::String(s)) = args {
+        return s.clone();
+    }
+    if let Some(v) = args {
+        return serde_json::to_string(v).unwrap_or_default();
+    }
+
+    match item_type {
+        "commandExecution" => {
+            let command = item.command.as_deref().unwrap_or("");
+            let dir_path = item.cwd.as_deref().unwrap_or(".");
+            format!(
+                "{{\"command\":{},\"dir_path\":{}}}",
+                serde_json::to_string(command).unwrap_or_default(),
+                serde_json::to_string(dir_path).unwrap_or_default()
+            )
         }
-    } else {
-        content
-    };
-    messages.push(json!({"role": "tool", "tool_call_id": call_id, "content": content}));
+        "local_shell_call" => {
+            let command = item
+                .action
+                .as_ref()
+                .and_then(|a| match a {
+                    JsonValue::Object(m) => m.get("exec"),
+                    _ => None,
+                })
+                .and_then(|exec| match exec {
+                    JsonValue::Object(m) => m.get("command"),
+                    _ => None,
+                })
+                .map(|v| serde_json::to_string(v).unwrap_or_default())
+                .unwrap_or_else(|| "[]".into());
+            format!("{{\"command\":{command}}}")
+        }
+        "fileChange" => {
+            let path = item
+                .changes
+                .as_ref()
+                .and_then(|c| c.first())
+                .map(|c| c.path.as_str())
+                .unwrap_or("unknown");
+            format!(
+                "{{\"file_path\":{}}}",
+                serde_json::to_string(path).unwrap_or_default()
+            )
+        }
+        _ => "{}".into(),
+    }
 }
 
-fn extract_content_text(content_raw: Option<&Value>) -> String {
-    match content_raw {
+fn process_tool_output(item: &InputItem, messages: &mut Vec<ChatMessage>) {
+    let call_id = item
+        .call_id
+        .as_deref()
+        .or(item.id.as_deref())
+        .unwrap_or("call_unknown")
+        .to_string();
+
+    let output_raw = item
+        .output
+        .as_ref()
+        .or(item.content.as_ref())
+        .or(item.stdout.as_ref());
+
+    let mut content = extract_content_text(output_raw);
+    if content.is_empty() {
+        if let Some(stderr) = item.stderr.as_deref() {
+            content = format!("Error: {stderr}");
+        }
+    }
+
+    messages.push(ChatMessage {
+        role: "tool".into(),
+        content: Some(ChatContent::Text(content)),
+        reasoning_content: None,
+        thought_signature: None,
+        tool_calls: Vec::new(),
+        tool_call_id: Some(call_id),
+        name: None,
+    });
+}
+
+fn extract_content_text(content: Option<&Content>) -> String {
+    match content {
         None => String::new(),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(arr)) => arr
+        Some(Content::Text(s)) => s.clone(),
+        Some(Content::Parts(parts)) => parts
             .iter()
-            .map(|part| {
-                let ptype = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                match ptype {
-                    "input_text" | "text" | "output_text" => part
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    _ => String::new(),
-                }
+            .map(|p| match p.part_type.as_str() {
+                "input_text" | "text" | "output_text" => p.text.clone().unwrap_or_default(),
+                _ => String::new(),
             })
             .collect::<Vec<_>>()
             .join(""),
-        _ => String::new(),
+        Some(Content::Json(_)) => String::new(),
     }
 }
 
-fn ensure_last_assistant(messages: &mut Vec<Value>) -> usize {
-    if let Some(last) = messages.last()
-        && last.get("role").and_then(|r| r.as_str()) == Some("assistant")
-    {
-        return messages.len() - 1;
+fn ensure_last_assistant(messages: &mut Vec<ChatMessage>) -> usize {
+    if let Some(last) = messages.last() {
+        if last.role == "assistant" {
+            return messages.len() - 1;
+        }
     }
-    messages.push(json!({"role": "assistant", "content": null}));
+    messages.push(ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        reasoning_content: None,
+        thought_signature: None,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        name: None,
+    });
     messages.len() - 1
 }
 
-fn normalize_tools(tools: &[Value]) -> Vec<Value> {
-    tools.iter().map(|t| {
-        if t.get("type").and_then(|v| v.as_str()) == Some("function") && t.get("function").is_none() {
-            json!({"type": "function", "function": {"name": t.get("name"), "description": t.get("description"), "parameters": t.get("parameters"), "strict": t.get("strict").unwrap_or(&Value::Bool(false))}})
-        } else { t.clone() }
-    }).collect()
+fn chat_content_to_string(content: Option<&ChatContent>) -> String {
+    match content {
+        None => String::new(),
+        Some(ChatContent::Text(s)) => s.clone(),
+        Some(ChatContent::Parts(parts)) => parts
+            .iter()
+            .map(|p| match p.part_type.as_str() {
+                "input_text" | "text" | "output_text" => p.text.clone().unwrap_or_default(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    }
+}
+
+fn normalize_tool(mut tool: Tool) -> Tool {
+    if tool.tool_type == "function" && tool.function.is_none() {
+        if let Some(name) = tool.name.clone() {
+            tool.function = Some(crate::schema::openai::FunctionDef {
+                name,
+                description: tool.description.clone(),
+                parameters: tool.parameters.clone(),
+            });
+        }
+    }
+    tool
 }

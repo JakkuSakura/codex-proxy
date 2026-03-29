@@ -2,169 +2,519 @@ use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::Stream;
 use regex::Regex;
-use serde_json::{Value, json};
+use serde::Deserialize;
+use serde::Serialize;
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
 use crate::config::CONFIG;
+use crate::schema::json_value::JsonValue;
+use crate::schema::openai::ChatRequest;
+use crate::schema::sse::{
+    CreditsData, FunctionCallItem, InputTokensDetails, MessageItem, OutputContentPart, OutputItem,
+    OutputTokensDetails, RateLimitsData, ReasoningContentPart, ReasoningItem,
+    ResponseCompletedData, ResponseCreatedData, ResponseEvent, ResponseObject,
+    ResponseOutputItemAddedData, ResponseOutputItemDoneData, ResponseOutputTextDeltaData,
+    ServerReasoningIncludedData, SummaryPart, Usage,
+};
 
 pub fn stream_responses_sse(
     byte_stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     resp_id: &str,
     model: &str,
     created_ts: i64,
-    request_metadata: &Value,
+    request: &ChatRequest,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> {
     let resp_id = resp_id.to_string();
     let model = model.to_string();
-    let metadata = request_metadata.clone();
+    let req = request.clone();
     let re_header = Regex::new(r"\*\*(.*?)\*\*").unwrap();
 
     Box::pin(async_stream::stream! {
         let mut seq_num: u64 = 0;
         let mut global_next_idx: usize = 0;
-        let mut active_items: std::collections::HashMap<String, (Value, usize)> = std::collections::HashMap::new();
-        let mut output_items: Vec<Value> = Vec::new();
-        let mut final_usage: Option<Value> = None;
 
-        fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
-        fn now_secs() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) }
+        let mut active_message: Option<(usize, OutputItem)> = None;
+        let mut active_reasoning: Option<(usize, OutputItem)> = None;
+        let mut completed_items: Vec<(usize, OutputItem)> = Vec::new();
+        let mut final_usage: Option<Usage> = None;
 
-        let mut send_evt = |evt_type: &str, data: Value| -> Option<Bytes> {
-            seq_num += 1;
-            let mut evt = json!({"id": format!("evt_{}_{seq_num}", now_ms()), "object": "response.event", "type": evt_type, "created_at": now_secs(), "sequence_number": seq_num});
-            if let Value::Object(map) = data { for (k, v) in map { evt.as_object_mut().unwrap().insert(k, v); } }
-            if CONFIG.debug_mode { debug!("SSE OUT: {} - {}", evt_type, serde_json::to_string(&evt).unwrap_or_default()); }
-            Some(Bytes::from(format!("event: {}\ndata: {}\n\n", evt_type, serde_json::to_string(&evt).unwrap_or_default())))
-        };
+        yield Ok(encode_event(
+            &mut seq_num,
+            "response.created",
+            ResponseCreatedData {
+                response: response_in_progress(&resp_id, &model, created_ts, &req),
+            },
+        ));
 
-        if let Some(bytes) = send_evt("response.created", json!({"response": {
-            "id": &resp_id, "object": "response", "created_at": created_ts, "model": &model, "status": "in_progress",
-            "temperature": metadata.get("temperature").and_then(|t| t.as_f64()).unwrap_or(1.0),
-            "top_p": metadata.get("top_p").and_then(|t| t.as_f64()).unwrap_or(1.0),
-            "tool_choice": metadata.get("tool_choice").and_then(|v| v.as_str()).unwrap_or("auto"),
-            "tools": metadata.get("tools").cloned().unwrap_or(json!([])), "parallel_tool_calls": true,
-            "store": metadata.get("store").and_then(|s| s.as_bool()).unwrap_or(true),
-            "metadata": metadata.get("metadata").cloned().unwrap_or(json!({})), "output": [],
-        }})) { yield Ok(bytes); }
-
-        if let Some(bytes) = send_evt("models_etag", json!({"etag": "v1-gemini-gpt-5-2-parity"})) { yield Ok(bytes); }
-        if let Some(bytes) = send_evt("server_reasoning_included", json!({"included": true})) { yield Ok(bytes); }
-        if let Some(bytes) = send_evt("rate_limits", json!({"primary": null, "secondary": null, "credits": {"has_credits": true, "unlimited": false, "balance": null}})) { yield Ok(bytes); }
+        yield Ok(encode_event(
+            &mut seq_num,
+            "models_etag",
+            crate::schema::sse::ModelsEtagData {
+                etag: "v1-gemini-gpt-5-2-parity",
+            },
+        ));
+        yield Ok(encode_event(
+            &mut seq_num,
+            "server_reasoning_included",
+            ServerReasoningIncludedData { included: true },
+        ));
+        yield Ok(encode_event(
+            &mut seq_num,
+            "rate_limits",
+            RateLimitsData {
+                primary: Some(JsonValue::Null),
+                secondary: Some(JsonValue::Null),
+                credits: CreditsData {
+                    has_credits: true,
+                    unlimited: false,
+                    balance: Some(JsonValue::Null),
+                },
+            },
+        ));
 
         let mut byte_stream = std::pin::pin!(byte_stream);
         while let Some(chunk_result) = byte_stream.next().await {
-            let chunk = match chunk_result { Ok(c) => c, Err(e) => { debug!("Stream error: {}", e); break; } };
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => { debug!("Stream error: {}", e); break; }
+            };
             let text = String::from_utf8_lossy(&chunk);
             for line in text.lines() {
-                if !line.starts_with("data: ") || line == "data: [DONE]" { continue; }
-                let data: Value = match serde_json::from_str(&line[6..]) { Ok(d) => d, Err(_) => continue };
-                let resp_part = data.get("response").cloned().unwrap_or(data.clone());
-
-                if let Some(usage) = resp_part.get("usageMetadata") {
-                    let it = usage.get("promptTokenCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let ot = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let rt = usage.get("thinkingTokenCount").and_then(|v| v.as_u64()).unwrap_or(0);
-                    final_usage = Some(json!({"input_tokens": it, "input_tokens_details": {"cached_tokens": usage.get("cachedContentTokenCount").and_then(|v| v.as_u64()).unwrap_or(0)}, "output_tokens": ot, "output_tokens_details": {"reasoning_tokens": rt}, "total_tokens": it + ot + rt}));
+                if !line.starts_with("data: ") || line == "data: [DONE]" {
+                    continue;
                 }
 
-                let candidates = match resp_part.get("candidates").and_then(|c| c.as_array()) { Some(c) if !c.is_empty() => c, _ => continue };
-                let cand = &candidates[0];
-                let parts = match cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) { Some(p) => p, None => continue };
+                let data_str = &line[6..];
+                let chunk: GeminiChunk = match serde_json::from_str(data_str) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                let resp_part = chunk.response();
+
+                if let Some(usage) = &resp_part.usage_metadata {
+                    let it = usage.prompt_token_count.unwrap_or(0);
+                    let ot = usage.candidates_token_count.unwrap_or(0);
+                    let rt = usage.thinking_token_count.unwrap_or(0);
+                    let cached = usage.cached_content_token_count.unwrap_or(0);
+                    final_usage = Some(Usage {
+                        input_tokens: it,
+                        input_tokens_details: Some(InputTokensDetails { cached_tokens: cached }),
+                        output_tokens: ot,
+                        output_tokens_details: Some(OutputTokensDetails { reasoning_tokens: rt }),
+                        total_tokens: it + ot + rt,
+                    });
+                }
+
+                let cand = match resp_part.candidates.first() {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let parts = match cand.content.as_ref() {
+                    Some(c) => c.parts.as_slice(),
+                    None => continue,
+                };
+
                 let mut text_buf = String::new();
                 let mut reasoning_text = String::new();
 
                 for p in parts {
-                    if let Some(fc) = p.get("functionCall") {
-                        let fc_name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                        let fc_args = fc.get("args").cloned().unwrap_or(json!({}));
-                        let args_str = serde_json::to_string(&fc_args).unwrap_or_default();
-                        let itype = match fc_name { "shell" | "container.exec" | "shell_command" => "local_shell_call", _ => "function_call" };
+                    if let Some(fc) = &p.function_call {
+                        let fc_name = fc.name.as_str();
+                        let fc_args_str = serde_json::to_string(&fc.args).unwrap_or_else(|_| "{}".into());
                         let call_id = format!("call_{}_{}", now_ms(), global_next_idx);
-                        let mut item = json!({"id": &call_id, "type": itype, "status": "in_progress", "name": fc_name, "arguments": &args_str, "call_id": &call_id});
-                        if itype == "local_shell_call" { item.as_object_mut().unwrap().insert("action".into(), json!({"type": "exec", "command": fc_args.get("command").cloned().unwrap_or(json!([]))})); }
-                        if let Some(sig) = p.get("thoughtSignature").and_then(|s| s.as_str()) { item.as_object_mut().unwrap().insert("thought_signature".into(), json!(sig)); }
-                        let idx = global_next_idx; global_next_idx += 1;
-                        if let Some(bytes) = send_evt("response.output_item.added", json!({"response_id": &resp_id, "output_index": idx, "item": &item})) { yield Ok(bytes); }
-                        item.as_object_mut().unwrap().insert("status".into(), json!("completed"));
-                        if let Some(bytes) = send_evt("response.output_item.done", json!({"response_id": &resp_id, "output_index": idx, "item": item})) { yield Ok(bytes); }
-                        output_items.push(item);
-                    } else {
-                        let tv = p.get("thought");
-                        let tx = p.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                        let is_reasoning = tv.map(|v| v.is_string()).unwrap_or(false) || tv == Some(&Value::Bool(true));
-                        let t_chunk = tv.and_then(|v| v.as_str()).unwrap_or(tx);
-                        if is_reasoning && !t_chunk.is_empty() { reasoning_text.push_str(t_chunk); }
-                        else if tv != Some(&Value::Bool(true)) && !tx.is_empty() { text_buf.push_str(tx); }
+
+                        let item = if fc_name == "shell" || fc_name == "container.exec" || fc_name == "shell_command" {
+                            let cmd = extract_command_from_args(&fc_args_str);
+                            OutputItem::LocalShellCall(crate::schema::sse::LocalShellCallItem {
+                                id: call_id.clone(),
+                                status: "in_progress".into(),
+                                name: fc_name.to_string(),
+                                arguments: fc_args_str,
+                                call_id: call_id.clone(),
+                                action: crate::schema::sse::ShellAction { action_type: "exec", command: cmd },
+                                thought_signature: p.thought_signature.clone(),
+                            })
+                        } else {
+                            OutputItem::FunctionCall(FunctionCallItem {
+                                id: call_id.clone(),
+                                status: "in_progress".into(),
+                                name: fc_name.to_string(),
+                                arguments: fc_args_str,
+                                call_id: call_id.clone(),
+                                thought_signature: p.thought_signature.clone(),
+                            })
+                        };
+
+                        let idx = global_next_idx;
+                        global_next_idx += 1;
+                        yield Ok(encode_event(
+                            &mut seq_num,
+                            "response.output_item.added",
+                            ResponseOutputItemAddedData {
+                                response_id: resp_id.clone(),
+                                output_index: idx,
+                                item: item.clone(),
+                            },
+                        ));
+
+                        let mut done_item = item;
+                        set_item_status(&mut done_item, "completed");
+                        yield Ok(encode_event(
+                            &mut seq_num,
+                            "response.output_item.done",
+                            ResponseOutputItemDoneData {
+                                response_id: resp_id.clone(),
+                                output_index: idx,
+                                item: done_item.clone(),
+                            },
+                        ));
+                        completed_items.push((idx, done_item));
+                        continue;
                     }
-                }
 
-                if !reasoning_text.is_empty() {
-                    let entry = active_items.entry("reasoning".to_string()).or_insert_with(|| {
-                        let idx = global_next_idx; global_next_idx += 1;
-                        (json!({"id": format!("rs_{}_{}", now_ms(), idx), "type": "reasoning", "status": "in_progress", "summary": [], "content": [{"type": "reasoning_text", "text": ""}]}), idx)
-                    });
-                    let (ref mut item, _) = *entry;
-                    let current = item["content"][0]["text"].as_str().unwrap_or("");
-                    item["content"][0]["text"] = json!(format!("{current}{reasoning_text}"));
-                }
+                    let is_reasoning = match &p.thought {
+                        Some(GeminiThought::Text(_)) => true,
+                        Some(GeminiThought::Bool(true)) => true,
+                        _ => false,
+                    };
 
-                if !text_buf.is_empty() {
-                    let entry = active_items.entry("message".to_string()).or_insert_with(|| {
-                        let idx = global_next_idx; global_next_idx += 1;
-                        let item = json!({"id": format!("msg_{}_{}", now_ms(), idx), "type": "message", "role": "assistant", "status": "in_progress", "content": [{"type": "output_text", "text": ""}]});
-                        (item, idx)
-                    });
-                    let (ref mut item, idx) = *entry;
-                    let current = item["content"][0]["text"].as_str().unwrap_or("");
-                    item["content"][0]["text"] = json!(format!("{current}{text_buf}"));
-                    if let Some(bytes) = send_evt("response.output_text.delta", json!({"response_id": &resp_id, "item_id": item["id"].clone(), "output_index": idx, "content_index": 0, "delta": text_buf})) { yield Ok(bytes); }
+                    let text_chunk = match &p.thought {
+                        Some(GeminiThought::Text(s)) => s.as_str(),
+                        _ => p.text.as_deref().unwrap_or(""),
+                    };
 
-                    if let Some(r_entry) = active_items.get("reasoning") {
-                        let full = r_entry.0["content"][0]["text"].as_str().unwrap_or("");
-                        let headers: Vec<&str> = re_header.captures_iter(full).filter_map(|c| c.get(1)).map(|m| m.as_str()).collect();
-                        if !headers.is_empty() {
-                            let summaries: Vec<Value> = headers.iter().map(|h| json!({"type": "summary_text", "text": h})).collect();
-                            let r_entry_mut = active_items.get_mut("reasoning").unwrap();
-                            r_entry_mut.0.as_object_mut().unwrap().insert("summary".into(), json!(summaries));
+                    if is_reasoning && !text_chunk.is_empty() {
+                        reasoning_text.push_str(text_chunk);
+                    } else if !matches!(p.thought, Some(GeminiThought::Bool(true))) {
+                        if let Some(tx) = p.text.as_deref() {
+                            if !tx.is_empty() {
+                                text_buf.push_str(tx);
+                            }
                         }
                     }
                 }
 
-                if let Some(citations) = cand.get("citationMetadata").and_then(|c| c.get("citations")).and_then(|c| c.as_array()) {
-                    for c in citations {
-                        if let (Some(title), Some(uri)) = (c.get("title").and_then(|t| t.as_str()), c.get("uri").and_then(|u| u.as_str()))
-                            && let Some(entry) = active_items.get_mut("message") {
-                                let item = &mut entry.0;
-                                let current = item["content"][0]["text"].as_str().unwrap_or("").to_string();
-                                item["content"][0]["text"] = json!(format!("{current}\n({title}) {uri}"));
+                if !reasoning_text.is_empty() {
+                    if active_reasoning.is_none() {
+                        let idx = global_next_idx;
+                        global_next_idx += 1;
+                        let item = OutputItem::Reasoning(ReasoningItem {
+                            id: format!("rs_{}_{}", now_ms(), idx),
+                            status: "in_progress".into(),
+                            summary: Vec::new(),
+                            content: vec![ReasoningContentPart::ReasoningText { text: String::new() }],
+                        });
+                        active_reasoning = Some((idx, item));
+                    }
+                    if let Some((_idx, ref mut item)) = active_reasoning {
+                        if let OutputItem::Reasoning(r) = item {
+                            let current = match r.content.first() {
+                                Some(ReasoningContentPart::ReasoningText { text }) => text.clone(),
+                                _ => String::new(),
+                            };
+                            r.content = vec![ReasoningContentPart::ReasoningText { text: format!("{current}{reasoning_text}") }];
+                        }
+                    }
+                }
+
+                if !text_buf.is_empty() {
+                    if active_message.is_none() {
+                        let idx = global_next_idx;
+                        global_next_idx += 1;
+                        let item = OutputItem::Message(MessageItem {
+                            id: format!("msg_{}_{}", now_ms(), idx),
+                            role: "assistant",
+                            status: "in_progress".into(),
+                            content: vec![OutputContentPart::OutputText { text: String::new() }],
+                        });
+                        active_message = Some((idx, item));
+                    }
+
+                    if let Some((idx, ref mut item)) = active_message {
+                        if let OutputItem::Message(m) = item {
+                            let current = match m.content.first() {
+                                Some(OutputContentPart::OutputText { text }) => text.clone(),
+                                _ => String::new(),
+                            };
+                            let merged = format!("{current}{text_buf}");
+                            m.content = vec![OutputContentPart::OutputText { text: merged.clone() }];
+                            yield Ok(encode_event(
+                                &mut seq_num,
+                                "response.output_text.delta",
+                                ResponseOutputTextDeltaData {
+                                    response_id: resp_id.clone(),
+                                    item_id: m.id.clone(),
+                                    output_index: idx as i64,
+                                    content_index: 0,
+                                    delta: text_buf.clone(),
+                                },
+                            ));
+
+                            // Update reasoning summary from full reasoning text.
+                            if let Some((_ridx, ref mut r_item)) = active_reasoning {
+                                if let OutputItem::Reasoning(r) = r_item {
+                                    let full = match r.content.first() {
+                                        Some(ReasoningContentPart::ReasoningText { text }) => text.as_str(),
+                                        _ => "",
+                                    };
+                                    let headers: Vec<String> = re_header
+                                        .captures_iter(full)
+                                        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+                                        .collect();
+                                    if !headers.is_empty() {
+                                        r.summary = headers
+                                            .iter()
+                                            .map(|h| SummaryPart::SummaryText { text: h.clone() })
+                                            .collect();
+                                    }
+                                }
                             }
+                        }
+                    }
+                }
+
+                if let Some(citations) = cand.citation_metadata.as_ref().map(|c| c.citations.as_slice()) {
+                    for c in citations {
+                        if let (Some(title), Some(uri)) = (c.title.as_deref(), c.uri.as_deref()) {
+                            if let Some((_idx, ref mut item)) = active_message {
+                                if let OutputItem::Message(m) = item {
+                                    let current = match m.content.first() {
+                                        Some(OutputContentPart::OutputText { text }) => text.clone(),
+                                        _ => String::new(),
+                                    };
+                                    m.content = vec![OutputContentPart::OutputText { text: format!("{current}\n({title}) {uri}") }];
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
-        let keys: Vec<String> = active_items.keys().cloned().collect();
-        for key in keys {
-            if let Some((mut item, idx)) = active_items.remove(&key) {
-                item.as_object_mut().unwrap().insert("status".into(), json!("completed"));
-                if let Some(bytes) = send_evt("response.output_item.done", json!({"response_id": &resp_id, "output_index": idx, "item": item})) { yield Ok(bytes); }
-                output_items.push(item);
-            }
+        if let Some((idx, mut item)) = active_reasoning.take() {
+            set_item_status(&mut item, "completed");
+            yield Ok(encode_event(
+                &mut seq_num,
+                "response.output_item.done",
+                ResponseOutputItemDoneData {
+                    response_id: resp_id.clone(),
+                    output_index: idx,
+                    item: item.clone(),
+                },
+            ));
+            completed_items.push((idx, item));
+        }
+        if let Some((idx, mut item)) = active_message.take() {
+            set_item_status(&mut item, "completed");
+            yield Ok(encode_event(
+                &mut seq_num,
+                "response.output_item.done",
+                ResponseOutputItemDoneData {
+                    response_id: resp_id.clone(),
+                    output_index: idx,
+                    item: item.clone(),
+                },
+            ));
+            completed_items.push((idx, item));
         }
 
-        if let Some(bytes) = send_evt("response.completed", json!({"response": {
-            "id": &resp_id, "object": "response", "status": "completed", "model": &model,
-            "created_at": created_ts, "completed_at": now_secs(),
-            "usage": final_usage.unwrap_or(json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})),
-            "output": output_items,
-            "temperature": metadata.get("temperature").and_then(|t| t.as_f64()).unwrap_or(1.0),
-            "top_p": metadata.get("top_p").and_then(|t| t.as_f64()).unwrap_or(1.0),
-            "tool_choice": metadata.get("tool_choice").and_then(|v| v.as_str()).unwrap_or("auto"),
-            "tools": metadata.get("tools").cloned().unwrap_or(json!([])), "parallel_tool_calls": true,
-            "store": metadata.get("store").and_then(|s| s.as_bool()).unwrap_or(true),
-            "metadata": metadata.get("metadata").cloned().unwrap_or(json!({})),
-        }})) { yield Ok(bytes); }
+        completed_items.sort_by_key(|(idx, _)| *idx);
+        let final_output: Vec<OutputItem> = completed_items.into_iter().map(|(_, item)| item).collect();
+
+        let mut final_resp = response_in_progress(&resp_id, &model, created_ts, &req);
+        final_resp.status = "completed".into();
+        final_resp.completed_at = Some(now_secs());
+        final_resp.usage = Some(final_usage.unwrap_or_else(|| Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            input_tokens_details: None,
+            output_tokens_details: None,
+        }));
+        final_resp.output = final_output;
+
+        yield Ok(encode_event(
+            &mut seq_num,
+            "response.completed",
+            ResponseCompletedData { response: final_resp },
+        ));
     })
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum GeminiChunk {
+    Wrapped { response: GeminiResponse },
+    Direct(GeminiResponse),
+}
+
+impl GeminiChunk {
+    fn response(&self) -> &GeminiResponse {
+        match self {
+            GeminiChunk::Wrapped { response } => response,
+            GeminiChunk::Direct(r) => r,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GeminiResponse {
+    #[serde(rename = "usageMetadata", default)]
+    usage_metadata: Option<GeminiUsageMetadata>,
+    #[serde(default)]
+    candidates: Vec<GeminiCandidate>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GeminiUsageMetadata {
+    #[serde(rename = "promptTokenCount", default)]
+    prompt_token_count: Option<u64>,
+    #[serde(rename = "candidatesTokenCount", default)]
+    candidates_token_count: Option<u64>,
+    #[serde(rename = "thinkingTokenCount", default)]
+    thinking_token_count: Option<u64>,
+    #[serde(rename = "cachedContentTokenCount", default)]
+    cached_content_token_count: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GeminiCandidate {
+    #[serde(default)]
+    content: Option<GeminiCandidateContent>,
+    #[serde(rename = "citationMetadata", default)]
+    citation_metadata: Option<CitationMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GeminiCandidateContent {
+    #[serde(default)]
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GeminiPart {
+    #[serde(rename = "functionCall", default)]
+    function_call: Option<GeminiFunctionCall>,
+    #[serde(rename = "thoughtSignature", default)]
+    thought_signature: Option<String>,
+    #[serde(default)]
+    thought: Option<GeminiThought>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GeminiFunctionCall {
+    name: String,
+    #[serde(default)]
+    args: JsonValue,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum GeminiThought {
+    Bool(bool),
+    Text(String),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CitationMetadata {
+    #[serde(default)]
+    citations: Vec<Citation>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct Citation {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    uri: Option<String>,
+}
+
+fn response_in_progress(
+    resp_id: &str,
+    model: &str,
+    created_ts: i64,
+    req: &ChatRequest,
+) -> ResponseObject {
+    ResponseObject {
+        id: resp_id.to_string(),
+        object: "response",
+        created_at: created_ts,
+        completed_at: None,
+        model: model.to_string(),
+        status: "in_progress".into(),
+        temperature: req.temperature.unwrap_or(1.0),
+        top_p: req.top_p.unwrap_or(1.0),
+        tool_choice: req.tool_choice.clone().unwrap_or_else(|| "auto".into()),
+        tools: req.tools.clone(),
+        parallel_tool_calls: true,
+        store: req.store,
+        metadata: req.metadata.clone(),
+        output: Vec::new(),
+        usage: None,
+    }
+}
+
+fn set_item_status(item: &mut OutputItem, status: &str) {
+    match item {
+        OutputItem::Message(m) => m.status = status.to_string(),
+        OutputItem::Reasoning(r) => r.status = status.to_string(),
+        OutputItem::FunctionCall(c) => c.status = status.to_string(),
+        OutputItem::LocalShellCall(c) => c.status = status.to_string(),
+    }
+}
+
+fn extract_command_from_args(args: &str) -> Vec<String> {
+    let parsed: Result<JsonValue, _> = serde_json::from_str(args);
+    match parsed {
+        Ok(JsonValue::Object(map)) => match map.get("command") {
+            Some(JsonValue::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn encode_event<T: Serialize>(seq_num: &mut u64, evt_type: &'static str, data: T) -> Bytes {
+    *seq_num += 1;
+    let evt = ResponseEvent {
+        id: format!("evt_{}_{}", now_ms(), seq_num),
+        object: "response.event",
+        event_type: evt_type,
+        created_at: now_secs(),
+        sequence_number: *seq_num,
+        data,
+    };
+    if CONFIG.debug_mode {
+        debug!(
+            "SSE OUT: {} - {}",
+            evt_type,
+            serde_json::to_string(&evt).unwrap_or_default()
+        );
+    }
+    Bytes::from(format!(
+        "event: {}\ndata: {}\n\n",
+        evt_type,
+        serde_json::to_string(&evt).unwrap_or_default()
+    ))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

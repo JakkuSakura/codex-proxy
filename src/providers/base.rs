@@ -1,13 +1,13 @@
 use crate::error::ProxyError;
+use crate::schema::openai::{ChatRequest, CompactRequest};
 use axum::body::Body;
 use axum::http::HeaderMap;
 use axum::response::Response;
-use serde_json::Value;
 
 pub trait Provider: Send + Sync {
     fn handle_request(
         &self,
-        data: Value,
+        data: ChatRequest,
         headers: HeaderMap,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
@@ -15,7 +15,7 @@ pub trait Provider: Send + Sync {
 
     fn handle_compact(
         &self,
-        _data: Value,
+        _data: CompactRequest,
         _headers: HeaderMap,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
