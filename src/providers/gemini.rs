@@ -2,17 +2,16 @@ use axum::body::Body;
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::gemini_utils::{
     GeminiContent, GeminiPart, GeminiSystemInstruction, map_messages, sanitize_params,
 };
-use crate::auth::{AuthType, GEMINI_AUTH};
+use crate::auth::{AuthType, GEMINI_AUTH_MANAGER};
 use crate::config::CONFIG;
 use crate::error::ProxyError;
-use crate::providers::base::Provider;
+use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::json_value::JsonValue;
 use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
 
@@ -35,17 +34,19 @@ impl GeminiProvider {
 
     async fn execute_stream(
         &self,
-        model: &str,
         req_data: &ChatRequest,
-        _headers: HeaderMap,
+        context: &ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
-        let auth_ctx = GEMINI_AUTH.get_auth_context(false).await?;
+        let auth_ctx = GEMINI_AUTH_MANAGER
+            .get_auth_context(&context.account, false)
+            .await?;
+        let model = context.upstream_model();
 
         let (contents, system_instruction) = map_messages(&req_data.messages, model);
         let temperature = req_data.temperature.unwrap_or(1.0);
         let top_p = req_data.top_p.unwrap_or(1.0);
         let max_tokens = req_data.max_tokens;
-        let reasoning_effort = &CONFIG.reasoning_effort;
+        let reasoning_effort = &CONFIG.reasoning.default_effort;
         let reasoning_cfg = CONFIG.reasoning.effort_levels.get(reasoning_effort);
 
         let mut gen_config = GeminiGenerationConfig {
@@ -57,13 +58,13 @@ impl GeminiProvider {
         if let Some(max_t) = max_tokens {
             gen_config.max_output_tokens = Some(max_t);
         }
-        if let Some(rc) = reasoning_cfg {
-            if rc.budget > 0 {
-                gen_config.thinking_config = Some(GeminiThinkingConfig {
-                    thinking_budget: rc.budget,
-                    include_thoughts: true,
-                });
-            }
+        if let Some(rc) = reasoning_cfg
+            && rc.budget > 0
+        {
+            gen_config.thinking_config = Some(GeminiThinkingConfig {
+                thinking_budget: rc.budget,
+                include_thoughts: true,
+            });
         }
 
         let (tools, tool_config) = apply_tools(req_data);
@@ -81,7 +82,7 @@ impl GeminiProvider {
                 (
                     format!(
                         "{}/v1beta/models/{model}:streamGenerateContent?alt=sse&key={key}",
-                        CONFIG.gemini_api_public
+                        CONFIG.providers.gemini.api_public
                     ),
                     header::HeaderMap::new(),
                     GeminiBodyKind::Public,
@@ -98,7 +99,7 @@ impl GeminiProvider {
                 (
                     format!(
                         "{}/v1internal:streamGenerateContent?alt=sse",
-                        CONFIG.gemini_api_internal
+                        CONFIG.providers.gemini.api_internal
                     ),
                     h,
                     GeminiBodyKind::Internal,
@@ -112,7 +113,7 @@ impl GeminiProvider {
                     .post(&url)
                     .headers(req_headers)
                     .json(&request_body)
-                    .timeout(std::time::Duration::from_secs(CONFIG.request_timeout_read))
+                    .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
                     .send()
                     .await?
             }
@@ -127,7 +128,7 @@ impl GeminiProvider {
                     .post(&url)
                     .headers(req_headers)
                     .json(&internal)
-                    .timeout(std::time::Duration::from_secs(CONFIG.request_timeout_read))
+                    .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
                     .send()
                     .await?
             }
@@ -136,6 +137,14 @@ impl GeminiProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(ProxyError::Auth(format!(
+                    "Gemini API unauthorized ({}): {}",
+                    status, body
+                )));
+            }
             return Err(ProxyError::Provider(format!(
                 "Gemini API error ({}): {}",
                 status, body
@@ -166,16 +175,12 @@ impl GeminiProvider {
     async fn handle_compact_impl(
         &self,
         data: &CompactRequest,
-        _headers: HeaderMap,
+        context: &ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
-        let auth_ctx = GEMINI_AUTH.get_auth_context(false).await?;
-        let compaction_model = CONFIG.compaction_model.as_deref().unwrap_or_else(|| {
-            CONFIG
-                .models
-                .first()
-                .map(|s| s.as_str())
-                .unwrap_or("gemini-2.5-flash-lite")
-        });
+        let auth_ctx = GEMINI_AUTH_MANAGER
+            .get_auth_context(&context.account, false)
+            .await?;
+        let compaction_model = context.upstream_model();
 
         let chat_req = crate::normalizer::normalize(ResponsesRequest {
             model: compaction_model.to_string(),
@@ -213,16 +218,14 @@ impl GeminiProvider {
             }],
         });
 
-        let gen_config = GeminiGenerationConfig {
-            temperature: 0.1,
-            top_p: 1.0,
-            max_output_tokens: Some(4096),
-            thinking_config: None,
-        };
-
         let body = GeminiRequestBody {
             contents,
-            generation_config: gen_config,
+            generation_config: GeminiGenerationConfig {
+                temperature: CONFIG.compaction.temperature,
+                top_p: 1.0,
+                max_output_tokens: Some(4096),
+                thinking_config: None,
+            },
             system_instruction,
             tools: None,
             tool_config: None,
@@ -234,7 +237,7 @@ impl GeminiProvider {
                 (
                     format!(
                         "{}/v1beta/models/{compaction_model}:streamGenerateContent?alt=sse&key={key}",
-                        CONFIG.gemini_api_public
+                        CONFIG.providers.gemini.api_public
                     ),
                     header::HeaderMap::new(),
                     GeminiSendBody::Public(body),
@@ -248,7 +251,7 @@ impl GeminiProvider {
                 (
                     format!(
                         "{}/v1internal:streamGenerateContent?alt=sse",
-                        CONFIG.gemini_api_internal
+                        CONFIG.providers.gemini.api_internal
                     ),
                     h,
                     GeminiSendBody::Internal(GeminiInternalBody {
@@ -265,13 +268,21 @@ impl GeminiProvider {
             .post(&url)
             .headers(req_headers)
             .json(&send_body)
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
             .send()
             .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(ProxyError::Auth(format!(
+                    "Gemini compaction unauthorized ({}): {}",
+                    status, body
+                )));
+            }
             return Err(ProxyError::Provider(format!(
                 "Compaction error ({}): {}",
                 status, body
@@ -319,22 +330,25 @@ impl GeminiProvider {
 impl Provider for GeminiProvider {
     fn handle_request(
         &self,
-        data: ChatRequest,
-        headers: HeaderMap,
+        _raw_request: ResponsesRequest,
+        normalized_request: ChatRequest,
+        _headers: HeaderMap,
+        context: ProviderExecutionContext,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
-        Box::pin(async move { self.execute_stream(&data.model, &data, headers).await })
+        Box::pin(async move { self.execute_stream(&normalized_request, &context).await })
     }
 
     fn handle_compact(
         &self,
         data: CompactRequest,
-        headers: HeaderMap,
+        _headers: HeaderMap,
+        context: ProviderExecutionContext,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
-        Box::pin(async move { self.handle_compact_impl(&data, headers).await })
+        Box::pin(async move { self.handle_compact_impl(&data, &context).await })
     }
 
     fn clone_box(&self) -> Box<dyn Provider + Send + Sync> {

@@ -16,7 +16,7 @@ async fn main() {
     info!("Starting codex-proxy...");
 
     let config = &codex_proxy::config::CONFIG;
-    let addr = format!("{}:{}", config.host, config.port);
+    let addr = format!("{}:{}", config.server.host, config.server.port);
 
     print_startup_info();
 

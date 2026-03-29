@@ -491,7 +491,7 @@ fn encode_event<T: Serialize>(seq_num: &mut u64, evt_type: &'static str, data: T
         sequence_number: *seq_num,
         data,
     };
-    if CONFIG.debug_mode {
+    if CONFIG.server.debug_mode {
         debug!(
             "SSE OUT: {} - {}",
             evt_type,

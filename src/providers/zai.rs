@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
+use crate::account_pool::AccountAuth;
 use crate::config::CONFIG;
 use crate::error::ProxyError;
-use crate::providers::base::Provider;
+use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::json_value::JsonValue;
 use crate::schema::openai::{
-    ChatContent, ChatMessage, ChatRequest, CompactRequest, Tool, ToolCall,
+    ChatContent, ChatMessage, ChatRequest, CompactRequest, ResponsesRequest, Tool, ToolCall,
 };
 use crate::schema::sse::{
     FunctionCallItem, LocalShellCallItem, MessageItem, OutputContentPart, OutputItem,
@@ -38,34 +39,18 @@ impl ZAIProvider {
         &self,
         req: &ChatRequest,
         headers: HeaderMap,
+        context: &ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
-        let auth_header = headers
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let auth = if !CONFIG.z_ai_api_key.is_empty() {
-            Some(format!("Bearer {}", CONFIG.z_ai_api_key))
-        } else {
-            auth_header
-        };
-        if auth.is_none() {
-            return Err(ProxyError::Auth(
-                "Missing Z.AI API key. Set CODEX_PROXY_ZAI_API_KEY (recommended) or pass an Authorization header to the proxy."
-                    .into(),
-            ));
-        }
-
-        let zai_req = to_zai_chat_request(req);
-        let mut req_builder = self
+        let auth = resolve_zai_auth(headers, context)?;
+        let zai_req = to_zai_chat_request(req, context.upstream_model());
+        let resp = self
             .client
-            .post(&CONFIG.z_ai_url)
+            .post(&CONFIG.providers.zai.api_url)
+            .header("Authorization", auth)
             .json(&zai_req)
-            .timeout(std::time::Duration::from_secs(CONFIG.request_timeout_read));
-        if let Some(a) = &auth {
-            req_builder = req_builder.header("Authorization", a);
-        }
-
-        let resp = req_builder.send().await?;
+            .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
+            .send()
+            .await?;
         let status = resp.status();
         info!("Z.AI response status: {}", status);
 
@@ -75,7 +60,7 @@ impl ZAIProvider {
                 || status == reqwest::StatusCode::FORBIDDEN
             {
                 return Err(ProxyError::Auth(format!(
-                    "Z.AI request unauthorized ({}). Check CODEX_PROXY_ZAI_API_KEY. Body: {}",
+                    "Z.AI request unauthorized ({}). Body: {}",
                     status, body
                 )));
             }
@@ -131,14 +116,9 @@ impl ZAIProvider {
         &self,
         data: &CompactRequest,
         headers: HeaderMap,
+        context: &ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
-        let compaction_model = CONFIG.compaction_model.as_deref().unwrap_or_else(|| {
-            CONFIG
-                .models
-                .first()
-                .map(|s| s.as_str())
-                .unwrap_or("glm-4.6")
-        });
+        let compaction_model = context.upstream_model();
 
         let mut messages = match &data.input {
             crate::schema::openai::ResponsesInput::Text(s) => vec![ZaiMessage {
@@ -149,42 +129,25 @@ impl ZAIProvider {
                 name: None,
             }],
             crate::schema::openai::ResponsesInput::Items(items) => {
-                let mut req = ChatRequest {
+                crate::normalizer::normalize(ResponsesRequest {
                     model: compaction_model.to_string(),
-                    messages: Vec::new(),
-                    tools: Vec::new(),
+                    input: Some(crate::schema::openai::ResponsesInput::Items(items.clone())),
+                    instructions: None,
+                    previous_response_id: None,
+                    store: None,
+                    metadata: None,
+                    tools: None,
                     tool_choice: None,
                     temperature: None,
                     top_p: None,
                     max_tokens: None,
-                    stream: false,
-                    store: false,
-                    metadata: Default::default(),
-                    previous_response_id: None,
-                    include: Vec::new(),
-                };
-                // Reuse normalizer semantics for compaction input items.
-                req.messages =
-                    crate::normalizer::normalize(crate::schema::openai::ResponsesRequest {
-                        model: compaction_model.to_string(),
-                        input: Some(crate::schema::openai::ResponsesInput::Items(items.clone())),
-                        instructions: None,
-                        previous_response_id: None,
-                        store: None,
-                        metadata: None,
-                        tools: None,
-                        tool_choice: None,
-                        temperature: None,
-                        top_p: None,
-                        max_tokens: None,
-                        stream: None,
-                        include: None,
-                    })
-                    .messages;
-                req.messages
-                    .into_iter()
-                    .map(|m| to_zai_message(&m))
-                    .collect::<Vec<_>>()
+                    stream: None,
+                    include: None,
+                })
+                .messages
+                .into_iter()
+                .map(|m| to_zai_message(&m))
+                .collect::<Vec<_>>()
             }
         };
 
@@ -210,36 +173,20 @@ impl ZAIProvider {
             stream: false,
             tools: None,
             tool_choice: None,
-            temperature: Some(CONFIG.compaction_temperature),
+            temperature: Some(CONFIG.compaction.temperature),
             top_p: None,
             max_tokens: Some(4096),
         };
 
-        let auth_header = headers
-            .get("Authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let auth = if !CONFIG.z_ai_api_key.is_empty() {
-            Some(format!("Bearer {}", CONFIG.z_ai_api_key))
-        } else {
-            auth_header
-        };
-        if auth.is_none() {
-            return Err(ProxyError::Auth(
-                "Missing Z.AI API key. Set CODEX_PROXY_ZAI_API_KEY (recommended) or pass an Authorization header to the proxy."
-                    .into(),
-            ));
-        }
-
-        let mut req_builder = self
+        let auth = resolve_zai_auth(headers, context)?;
+        let resp = self
             .client
-            .post(&CONFIG.z_ai_url)
+            .post(&CONFIG.providers.zai.api_url)
+            .header("Authorization", auth)
             .json(&payload)
-            .timeout(std::time::Duration::from_secs(CONFIG.request_timeout_read));
-        if let Some(a) = &auth {
-            req_builder = req_builder.header("Authorization", a);
-        }
-        let resp = req_builder.send().await?;
+            .timeout(std::time::Duration::from_secs(CONFIG.timeouts.read_seconds))
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -247,7 +194,7 @@ impl ZAIProvider {
                 || status == reqwest::StatusCode::FORBIDDEN
             {
                 return Err(ProxyError::Auth(format!(
-                    "Z.AI compaction unauthorized ({}). Check CODEX_PROXY_ZAI_API_KEY. Body: {}",
+                    "Z.AI compaction unauthorized ({}). Body: {}",
                     status, body
                 )));
             }
@@ -274,22 +221,25 @@ impl ZAIProvider {
 impl Provider for ZAIProvider {
     fn handle_request(
         &self,
+        _raw_request: ResponsesRequest,
         data: ChatRequest,
         headers: HeaderMap,
+        context: ProviderExecutionContext,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
-        Box::pin(async move { self.execute_request(&data, headers).await })
+        Box::pin(async move { self.execute_request(&data, headers, &context).await })
     }
 
     fn handle_compact(
         &self,
         data: CompactRequest,
         headers: HeaderMap,
+        context: ProviderExecutionContext,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Response<Body>, ProxyError>> + Send + '_>,
     > {
-        Box::pin(async move { self.handle_compact_impl(&data, headers).await })
+        Box::pin(async move { self.handle_compact_impl(&data, headers, &context).await })
     }
 
     fn clone_box(&self) -> Box<dyn Provider + Send + Sync> {
@@ -334,14 +284,36 @@ struct ZaiMessage {
     name: Option<String>,
 }
 
-fn to_zai_chat_request(req: &ChatRequest) -> ZaiChatRequest {
+fn resolve_zai_auth(
+    headers: HeaderMap,
+    context: &ProviderExecutionContext,
+) -> Result<String, ProxyError> {
+    match &context.account.auth {
+        AccountAuth::ApiKey { api_key } if !api_key.is_empty() => Ok(format!("Bearer {api_key}")),
+        _ if CONFIG.providers.zai.allow_authorization_passthrough => headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                ProxyError::Auth(
+                    "Missing Z.AI API key. Configure the account auth or enable Authorization passthrough."
+                        .into(),
+                )
+            }),
+        _ => Err(ProxyError::Auth(
+            "Missing Z.AI API key. Configure the account auth for this Z.AI account.".into(),
+        )),
+    }
+}
+
+fn to_zai_chat_request(req: &ChatRequest, model: &str) -> ZaiChatRequest {
     let tools = if req.tools.is_empty() {
         None
     } else {
         Some(req.tools.iter().cloned().map(transform_tool).collect())
     };
     ZaiChatRequest {
-        model: req.model.clone(),
+        model: model.to_string(),
         messages: req.messages.iter().map(to_zai_message).collect(),
         stream: req.stream,
         tools,
@@ -472,65 +444,64 @@ fn map_zai_response_to_responses_api(z: &ZaiChatResponse) -> ResponseObject {
 
     let mut output: Vec<OutputItem> = Vec::new();
 
-    if let Some(choice) = z.choices.first() {
-        if let Some(msg) = &choice.message {
-            for (idx, tc) in msg.tool_calls.iter().enumerate() {
-                let call_id = tc
-                    .id
-                    .clone()
-                    .unwrap_or_else(|| format!("call_{}_{}", now_ms(), idx));
-                let name = tc
-                    .function
-                    .as_ref()
-                    .and_then(|f| f.name.clone())
-                    .unwrap_or_default();
-                let args = tc
-                    .function
-                    .as_ref()
-                    .and_then(|f| f.arguments.as_ref())
-                    .map(|a| serde_json::to_string(a).unwrap_or_default())
-                    .unwrap_or_else(|| "{}".into());
+    if let Some(choice) = z.choices.first()
+        && let Some(msg) = &choice.message
+    {
+        for (idx, tc) in msg.tool_calls.iter().enumerate() {
+            let call_id = tc
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("call_{}_{}", now_ms(), idx));
+            let name = tc
+                .function
+                .as_ref()
+                .and_then(|f| f.name.clone())
+                .unwrap_or_default();
+            let args = tc
+                .function
+                .as_ref()
+                .and_then(|f| f.arguments.as_ref())
+                .map(|a| serde_json::to_string(a).unwrap_or_default())
+                .unwrap_or_else(|| "{}".into());
 
-                let item = if name == "shell" || name == "container.exec" || name == "shell_command"
-                {
-                    let cmd = extract_command_from_args(&args);
-                    OutputItem::LocalShellCall(LocalShellCallItem {
-                        id: call_id.clone(),
-                        status: "completed".into(),
-                        name,
-                        arguments: args,
-                        call_id: call_id.clone(),
-                        action: crate::schema::sse::ShellAction {
-                            action_type: "exec",
-                            command: cmd,
-                        },
-                        thought_signature: None,
-                    })
-                } else {
-                    OutputItem::FunctionCall(FunctionCallItem {
-                        id: call_id.clone(),
-                        status: "completed".into(),
-                        name,
-                        arguments: args,
-                        call_id: call_id.clone(),
-                        thought_signature: None,
-                    })
-                };
-                output.push(item);
-            }
+            let item = if name == "shell" || name == "container.exec" || name == "shell_command" {
+                let cmd = extract_command_from_args(&args);
+                OutputItem::LocalShellCall(LocalShellCallItem {
+                    id: call_id.clone(),
+                    status: "completed".into(),
+                    name,
+                    arguments: args,
+                    call_id: call_id.clone(),
+                    action: crate::schema::sse::ShellAction {
+                        action_type: "exec",
+                        command: cmd,
+                    },
+                    thought_signature: None,
+                })
+            } else {
+                OutputItem::FunctionCall(FunctionCallItem {
+                    id: call_id.clone(),
+                    status: "completed".into(),
+                    name,
+                    arguments: args,
+                    call_id: call_id.clone(),
+                    thought_signature: None,
+                })
+            };
+            output.push(item);
+        }
 
-            if let Some(content) = msg.content.as_deref() {
-                if !content.is_empty() {
-                    output.push(OutputItem::Message(MessageItem {
-                        id: format!("msg_{}", now_ms()),
-                        role: "assistant",
-                        status: "completed".into(),
-                        content: vec![OutputContentPart::OutputText {
-                            text: content.to_string(),
-                        }],
-                    }));
-                }
-            }
+        if let Some(content) = msg.content.as_deref()
+            && !content.is_empty()
+        {
+            output.push(OutputItem::Message(MessageItem {
+                id: format!("msg_{}", now_ms()),
+                role: "assistant",
+                status: "completed".into(),
+                content: vec![OutputContentPart::OutputText {
+                    text: content.to_string(),
+                }],
+            }));
         }
     }
 

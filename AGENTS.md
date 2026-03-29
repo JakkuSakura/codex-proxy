@@ -2,136 +2,118 @@
 
 ## Overview
 
-The `codex-proxy` is a Python-based intermediary service for the Codex system, designed to handle API orchestration and environment-specific logic. It is container-native and relies on Docker for consistent execution.
+`codex-proxy` is a Rust service that exposes an OpenAI-compatible Responses API while routing requests to multiple upstream providers. The live architecture is provider-aware and account-aware: model resolution, sticky routing, account health, and provider selection are shared runtime concerns, while protocol translation stays inside provider implementations.
 
-## Infrastructure: Docker
+## Current Architecture
 
-- **Container Name**: `codex-proxy`
-- **Port**: `8765`
-- **Mounts**:
-  - `${HOME}/.gemini` is mounted to `/home/appuser/.gemini` for credential access.
-  - `./src` is mounted to `/app/src` to enable hot-reloading during development.
-- **Commands**: Use `docker-compose` for direct lifecycle management if scripts are not used.
+### Request flow
 
-## Control Script (`/scripts`)
+The main request path lives in `src/server.rs` and follows this sequence:
 
-The project uses a unified control script for all operations. Execute from the `codex-proxy/` root directory.
+1. Validate incoming OpenAI-style request payloads.
+2. Normalize `ResponsesRequest` payloads into the internal typed `ChatRequest` form.
+3. Resolve routing in one place:
+   - apply model overrides
+   - infer provider from configured model prefixes
+   - compute sticky-routing key from normalized message content
+   - choose a healthy account for that provider
+4. Dispatch to the selected provider implementation.
+5. Apply success/failure health updates and sticky binding updates after execution.
+
+### Providers
+
+Current provider modules:
+
+- `src/providers/gemini.rs`
+- `src/providers/zai.rs`
+- `src/providers/openai.rs`
+
+Provider registry responsibility is intentionally narrow: it maps `AccountProvider` to implementation. It does **not** own model prefix routing policy.
+
+### Runtime routing and account state
+
+Shared routing/account logic lives in:
+
+- `src/account_pool/pool.rs`
+- `src/account_pool/routing.rs`
+
+Important runtime behaviors:
+
+- multiple accounts per provider
+- health-aware account selection
+- sticky routing for KV-cache reuse
+- cooldown-based unhealthy recovery
+- per-account health stats surfaced to the UI/config view
+
+### Auth model
+
+Gemini auth is account-scoped via `src/auth/mod.rs`.
+
+- API-key Gemini accounts use account-local keys.
+- OAuth Gemini accounts maintain isolated token/project caches per account.
+- Z.AI and OpenAI currently use account-scoped API key auth.
+
+## Configuration
+
+Configuration now uses a structured v2 schema centered on:
+
+- `server`
+- `providers`
+- `models`
+- `routing`
+- `accounts`
+- `reasoning`
+- `timeouts`
+- `compaction`
+
+Key behaviors:
+
+- `accounts[]` is the source of truth for credentials.
+- `routing.model_overrides` rewrites requested models before provider resolution.
+- `routing.provider_prefixes` maps model prefixes to providers.
+- `models.compaction_model` routes compaction through the same shared routing path.
+- legacy flat config is only supported at startup migration time and is converted into the v2 internal config.
+
+## UI and config endpoint
+
+`GET /config` returns a typed snapshot of:
+
+- structured config sections
+- masked account auth data
+- account health snapshot
+- routing stats such as sticky binding count
+
+Treat `POST /config` as read-only/stub unless the user explicitly asks to fully implement config persistence for the new schema.
+
+## Development expectations
+
+When changing routing/auth/provider code:
+
+- keep protocol translation inside provider modules
+- keep provider selection/account selection in shared routing
+- do not reintroduce model-prefix routing inside provider registry
+- do not read provider credentials directly from global flat config
+- preserve the typed request/response flow in `src/schema/*`
+
+## Verification
+
+Preferred verification commands:
 
 ```bash
-./scripts/control.sh <command> [options]
+cargo fmt
+cargo check
+cargo test
 ```
 
-**Commands:**
+When touching routing/auth/config logic, also sanity check:
 
-- `start` - Start the proxy container in detached mode
-- `stop` - Stop and remove the proxy container
-- `logs` - Follow the logs of the proxy container
-- `test` - Run the pytest test suite
-- `run [-p|--profile <name>] -- "prompt"` - Rebuild container and run codex command through proxy
+- v2 config boot path
+- legacy flat config migration path
+- provider override routing
+- multi-account isolation
+- sticky-routing failover behavior
 
-## Development Patterns
+## Notes for future changes
 
-1. **Credentials**: Ensure your host machine has valid Gemini credentials at `~/.gemini`.
-2. **Iteration**: Use `control.sh run` to quickly test end-to-end changes.
-3. **Verification**: Always run `control.sh test` after modifications to ensure that chaining and proxy logic are still functional.
-
-**Examples:**
-
-```bash
-# Start the proxy
-./scripts/control.sh start
-
-# Run a test command
-./scripts/control.sh run -- "hello world"
-
-# Run with specific profile
-./scripts/control.sh run -p glm -- "test prompt"
-
-# Check logs
-./scripts/control.sh logs
-
-# Run tests
-./scripts/control.sh test
-
-# Stop the proxy
-./scripts/control.sh stop
-```
-
-## Engineering Mandate: Deep API Parity
-
-The primary goal of `codex-proxy` is to ensure seamless compatibility between multiple AI providers (Gemini, Z.AI) and the OpenAI Responses API protocol used by the Codex ecosystem. The proxy normalizes different wire formats to a unified internal OpenAI-like structure.
-
-### Core Architecture
-
-**Multi-Provider Support:**
-
-- **Gemini Provider** (`gemini*` models by default): Uses Google's internal and public APIs with OAuth2 authentication
-- **Z.AI Provider** (`glm*`, `zai*` models by default): Uses Z.AI's coding-focused API with Bearer token authentication
-- **Provider Registry**: Dynamically configured via `config.model_prefixes` to map model prefixes to providers
-
-**Request Normalization** (`normalizer.py`):
-
-- Converts OpenAI Responses API format (`/responses` endpoint) to internal OpenAI chat format
-- Handles instruction-to-system message mapping
-- Processes complex input structures including reasoning blocks, tool calls, and multi-part content
-- Normalizes tool definitions between flat and wrapped formats
-
-### Parity Requirements
-
-**OpenAI Responses API Compatibility:**
-
-- **Request Format**: Support `/responses` endpoint with `model`, `input`, `instructions`, `previous_response_id`, `store` fields
-- **Response Streaming**: Emit proper SSE events including `response.created`, `response.done`, and intermediate content chunks
-- **Tool Call Handling**: Preserve function call IDs, arguments, and parallel execution capabilities
-- **Reasoning Content**: Extract and properly format `reasoning_content` from Gemini thinking blocks
-- **Conversation Chaining**: Handle `previous_response_id` for multi-turn conversations
-- **Metadata Preservation**: Pass through headers like `x-codex-turn-state` and response metadata
-
-**Gemini Integration:**
-
-- **Authentication**: OAuth2 flow with proper token refresh and credential management
-- **Reasoning Extraction**: Parse Gemini's internal reasoning format and convert to OpenAI-compatible `reasoning_content`
-- **Tool Call Mapping**: Convert Gemini's function calling format to OpenAI's `tool_calls` structure
-- **Token Usage**: Map Gemini's token counts including `thinkingTokenCount` to OpenAI usage format
-- **Model Configuration**: Use `config.models` for model list, `config.compaction_model` for compaction, `config.fallback_models` for fallback logic
-- **Reasoning Configuration**: Use `config.reasoning` for customizable effort levels, with `config.reasoning_effort` as default
-- **Dynamic Provider Routing**: Use `config.model_prefixes` for custom model prefix to provider mappings
-- **Compaction Provider Selection**: For `/compact` endpoints, provider is determined by `config.compaction_model` (not the request's model), ensuring compaction works with any selected model. Both Gemini and Z.AI models support compaction.
-- **Reasoning Configuration**: Use `config.reasoning` for customizable effort levels and budgets
-
-**Z.AI Integration:**
-
-- **API Endpoint**: Use dedicated coding API at `https://api.z.ai/api/coding/paas/v4/chat/completions`
-- **Streaming**: Handle Z.AI's SSE streaming format with proper chunk processing
-- **Tool Call Support**: Process Z.AI's tool call deltas and assemble complete function calls
-- **Model Support**: Accept any GLM model name via configuration, with prefix-based routing to Z.AI provider. Both chat completions and compaction endpoints are supported.
-
-### Implementation Specifications
-
-**Streaming Protocol:**
-
-- Emit `response.created` event with full response object at start
-- Stream content deltas with proper sequence numbers
-- Handle tool call assembly from streaming deltas
-- Emit final usage statistics and completion events
-
-**Error Handling:**
-
-- Map provider-specific error codes to OpenAI-compatible format
-- Preserve rate limiting information and quota details
-- Handle authentication failures and token refresh scenarios
-
-**Performance Optimizations:**
-
-- Multi-threaded HTTP server with connection reuse
-- Binary JSON (orjson) for fast serialization when available
-- Efficient session management with connection pooling
-- Minimal request/response transformation overhead
-
-### Source References
-
-- **OpenAI Responses API**: `https://context7.com/websites/platform_openai/llms.txt?topic=Responses`
-- **Z.AI API Documentation**: `https://context7.com/websites/z_ai/llms.txt?topic=api`
-- **Reference Implementations**: Source code in `~/Work/codex-proxy/reference/` for protocol analysis
-
-The proxy must maintain 1:1 behavioral parity with native OpenAI Responses API while seamlessly bridging the underlying provider differences.
+- OpenAI forwarding is intended to stay straightforward: forward the OpenAI-shaped request upstream after swapping in the resolved upstream model and configured account auth.
+- If you add a new provider, wire it through the shared routing/account path instead of adding provider-specific dispatch in handlers.

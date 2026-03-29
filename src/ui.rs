@@ -3,6 +3,7 @@ use axum::http::header;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 
+use crate::account_pool::{AccountPool, AccountStatus, RoutingState};
 use crate::config::CONFIG;
 
 const HTML: &str = include_str!("ui/index.html");
@@ -17,57 +18,87 @@ pub fn get_html() -> Response<Body> {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct UiConfig {
+    pub server: UiServerConfig,
+    pub providers: crate::config::ProvidersConfig,
+    pub models: UiModelsConfig,
+    pub routing: UiRoutingConfig,
+    pub accounts: Vec<AccountStatus>,
+    pub reasoning: crate::config::ReasoningConfig,
+    pub timeouts: crate::config::TimeoutsConfig,
+    pub compaction: crate::config::CompactionConfig,
+    pub stats: UiStats,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UiServerConfig {
+    pub host: String,
     pub port: u16,
     pub log_level: String,
     pub debug_mode: bool,
-    pub z_ai_api_key: String,
-    pub gemini_api_key: String,
-    pub models: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UiModelsConfig {
+    pub served: Vec<String>,
     pub compaction_model: String,
-    pub request_timeout_connect: u64,
-    pub request_timeout_read: u64,
-    pub reasoning_effort: String,
+    pub fallback_models: std::collections::HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UiRoutingConfig {
+    pub model_overrides: std::collections::HashMap<String, String>,
+    pub sticky_routing: crate::config::StickyRoutingConfig,
+    pub health: crate::config::RoutingHealthConfig,
+    pub provider_prefixes: std::collections::HashMap<String, crate::account_pool::AccountProvider>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UiStats {
+    pub account_count: usize,
+    pub sticky_binding_count: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct UiConfigUpdate {
     #[serde(default)]
-    pub port: Option<u16>,
-    #[serde(default)]
-    pub log_level: Option<String>,
-    #[serde(default)]
-    pub debug_mode: Option<bool>,
-    #[serde(default)]
-    pub z_ai_api_key: Option<String>,
-    #[serde(default)]
-    pub gemini_api_key: Option<String>,
-    #[serde(default)]
-    pub models: Option<Vec<String>>,
-    #[serde(default)]
-    pub compaction_model: Option<String>,
-    #[serde(default)]
-    pub request_timeout_connect: Option<u64>,
-    #[serde(default)]
-    pub request_timeout_read: Option<u64>,
-    #[serde(default)]
-    pub reasoning_effort: Option<String>,
+    pub server: Option<serde_json::Value>,
 }
 
-pub fn get_current_config() -> UiConfig {
+pub fn get_current_config(account_pool: &AccountPool, routing_state: &RoutingState) -> UiConfig {
     UiConfig {
-        port: CONFIG.port,
-        log_level: CONFIG.log_level.clone(),
-        debug_mode: CONFIG.debug_mode,
-        z_ai_api_key: CONFIG.z_ai_api_key.clone(),
-        gemini_api_key: CONFIG.gemini_api_key.clone(),
-        models: CONFIG.models.clone(),
-        compaction_model: CONFIG.compaction_model.clone().unwrap_or_default(),
-        request_timeout_connect: CONFIG.request_timeout_connect,
-        request_timeout_read: CONFIG.request_timeout_read,
-        reasoning_effort: CONFIG.reasoning.default_effort.clone(),
+        server: UiServerConfig {
+            host: CONFIG.server.host.clone(),
+            port: CONFIG.server.port,
+            log_level: CONFIG.server.log_level.clone(),
+            debug_mode: CONFIG.server.debug_mode,
+        },
+        providers: CONFIG.providers.clone(),
+        models: UiModelsConfig {
+            served: CONFIG.models.served.clone(),
+            compaction_model: CONFIG.compaction_model().unwrap_or_default().to_string(),
+            fallback_models: CONFIG.models.fallback_models.clone(),
+        },
+        routing: UiRoutingConfig {
+            model_overrides: CONFIG.routing.model_overrides.clone(),
+            sticky_routing: CONFIG.routing.sticky_routing.clone(),
+            health: CONFIG.routing.health.clone(),
+            provider_prefixes: CONFIG.routing.provider_prefixes.clone(),
+        },
+        accounts: account_pool.all_accounts_snapshot(),
+        reasoning: CONFIG.reasoning.clone(),
+        timeouts: CONFIG.timeouts.clone(),
+        compaction: CONFIG.compaction.clone(),
+        stats: UiStats {
+            account_count: account_pool.account_count(),
+            sticky_binding_count: routing_state.snapshot_size(),
+        },
     }
 }
 
-pub fn apply_and_save(_data: &UiConfigUpdate) -> Result<UiConfig, crate::error::ProxyError> {
-    Ok(get_current_config())
+pub fn apply_and_save(
+    _data: &UiConfigUpdate,
+    account_pool: &AccountPool,
+    routing_state: &RoutingState,
+) -> Result<UiConfig, crate::error::ProxyError> {
+    Ok(get_current_config(account_pool, routing_state))
 }

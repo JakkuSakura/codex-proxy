@@ -34,6 +34,9 @@ pub enum ConfigError {
     #[error("Invalid model prefix: {0}")]
     InvalidPrefix(String),
 
+    #[error("Invalid value: {0}")]
+    InvalidValue(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

@@ -2,70 +2,50 @@ pub mod base;
 pub mod gemini;
 pub mod gemini_stream;
 pub mod gemini_utils;
+pub mod openai;
 pub mod zai;
 pub mod zai_stream;
 
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 
-use crate::config::CONFIG;
+use crate::account_pool::AccountProvider;
 use base::Provider;
 use gemini::GeminiProvider;
+use openai::OpenAiProvider;
 use zai::ZAIProvider;
 
-struct ProviderEntry {
-    prefix: String,
-    provider: Box<dyn Provider + Send + Sync>,
-}
-
 struct RegistryInner {
-    providers: Vec<ProviderEntry>,
+    providers: HashMap<AccountProvider, Box<dyn Provider + Send + Sync>>,
 }
 
 static REGISTRY: Lazy<RwLock<RegistryInner>> = Lazy::new(|| {
     RwLock::new(RegistryInner {
-        providers: Vec::new(),
+        providers: HashMap::new(),
     })
 });
 
 pub fn initialize_registry() {
     let mut reg = REGISTRY.write();
     reg.providers.clear();
-    reg.providers.push(ProviderEntry {
-        prefix: "gemini".into(),
-        provider: Box::new(GeminiProvider::new()),
-    });
-    reg.providers.push(ProviderEntry {
-        prefix: "zai".into(),
-        provider: Box::new(ZAIProvider::new()),
-    });
-    for (prefix, provider_key) in &CONFIG.model_prefixes {
-        if reg.providers.iter().any(|e| e.prefix == *prefix) {
-            continue;
-        }
-        let provider: Box<dyn Provider + Send + Sync> = match provider_key.as_str() {
-            "gemini" => Box::new(GeminiProvider::new()),
-            "zai" => Box::new(ZAIProvider::new()),
-            _ => continue,
-        };
-        reg.providers.push(ProviderEntry {
-            prefix: prefix.clone(),
-            provider,
-        });
-    }
+    reg.providers
+        .insert(AccountProvider::Gemini, Box::new(GeminiProvider::new()));
+    reg.providers
+        .insert(AccountProvider::Zai, Box::new(ZAIProvider::new()));
+    reg.providers
+        .insert(AccountProvider::OpenAi, Box::new(OpenAiProvider::new()));
 }
 
-pub fn get_provider(model_name: &str) -> Box<dyn Provider + Send + Sync> {
-    let reg = REGISTRY.read();
-    for entry in &reg.providers {
-        if model_name.starts_with(&entry.prefix) {
-            return entry.provider.clone_box();
-        }
-    }
-    for entry in &reg.providers {
-        if entry.prefix == "zai" {
-            return entry.provider.clone_box();
-        }
-    }
-    Box::new(ZAIProvider::new())
+pub fn get_provider(provider: AccountProvider) -> Box<dyn Provider + Send + Sync> {
+    REGISTRY
+        .read()
+        .providers
+        .get(&provider)
+        .map(|provider| provider.clone_box())
+        .unwrap_or_else(|| match provider {
+            AccountProvider::Gemini => Box::new(GeminiProvider::new()),
+            AccountProvider::Zai => Box::new(ZAIProvider::new()),
+            AccountProvider::OpenAi => Box::new(OpenAiProvider::new()),
+        })
 }

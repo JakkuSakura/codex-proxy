@@ -1,15 +1,17 @@
+use crate::account_pool::{Account, AccountAuth};
 use crate::config::CONFIG;
+use crate::error::ProxyError;
 use crate::schema::json_value::JsonValue;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::env;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-pub static GEMINI_AUTH: Lazy<GeminiAuth> = Lazy::new(GeminiAuth::new);
+pub static GEMINI_AUTH_MANAGER: Lazy<GeminiAuthManager> = Lazy::new(GeminiAuthManager::new);
 
 #[derive(Debug, Clone)]
 pub struct AuthContext {
@@ -123,65 +125,73 @@ struct TokenCache {
     expiry_ms: u64,
 }
 
+pub struct GeminiAuthManager {
+    clients: Mutex<HashMap<String, Arc<GeminiAuth>>>,
+}
+
+impl GeminiAuthManager {
+    pub fn new() -> Self {
+        Self {
+            clients: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn get_auth_context(
+        &self,
+        account: &Account,
+        force_refresh: bool,
+    ) -> Result<AuthContext, ProxyError> {
+        let auth = {
+            let mut clients = self.clients.lock().unwrap();
+            clients
+                .entry(account.id.clone())
+                .or_insert_with(|| Arc::new(GeminiAuth::new(account.clone())))
+                .clone()
+        };
+        auth.get_auth_context(force_refresh).await
+    }
+}
+
 pub struct GeminiAuth {
+    account: Account,
     client: reqwest::Client,
     cache: Mutex<Option<TokenCache>>,
     project_id_cache: Mutex<Option<String>>,
 }
 
-impl Default for GeminiAuth {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl GeminiAuth {
-    pub fn new() -> Self {
+    pub fn new(account: Account) -> Self {
         Self {
+            account,
             client: reqwest::Client::new(),
             cache: Mutex::new(None),
             project_id_cache: Mutex::new(None),
         }
     }
 
-    pub async fn get_auth_context(
-        &self,
-        force_refresh: bool,
-    ) -> Result<AuthContext, crate::error::ProxyError> {
-        let api_key = env::var("GEMINI_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-            .or_else(|| {
-                let key = &CONFIG.gemini_api_key;
-                if key.is_empty() {
-                    None
-                } else {
-                    Some(key.clone())
-                }
-            });
-        if let Some(key) = api_key {
-            return Ok(AuthContext {
-                api_key: Some(key),
+    pub async fn get_auth_context(&self, force_refresh: bool) -> Result<AuthContext, ProxyError> {
+        match &self.account.auth {
+            AccountAuth::ApiKey { api_key } => Ok(AuthContext {
+                api_key: Some(api_key.clone()),
                 access_token: None,
                 project_id: None,
                 auth_type: AuthType::Public,
-            });
+            }),
+            AccountAuth::GeminiOAuth { .. } => {
+                let token = self.get_access_token(force_refresh).await?;
+                let pid = self.get_project_id(&token).await?;
+                Ok(AuthContext {
+                    api_key: None,
+                    access_token: Some(token),
+                    project_id: Some(pid),
+                    auth_type: AuthType::Internal,
+                })
+            }
         }
-        let token = self.get_access_token(force_refresh).await?;
-        let pid = self.get_project_id(&token).await?;
-        Ok(AuthContext {
-            api_key: None,
-            access_token: Some(token),
-            project_id: Some(pid),
-            auth_type: AuthType::Internal,
-        })
     }
 
-    async fn get_access_token(
-        &self,
-        force_refresh: bool,
-    ) -> Result<String, crate::error::ProxyError> {
-        if let Ok(env_token) = env::var("GOOGLE_CLOUD_ACCESS_TOKEN") {
+    async fn get_access_token(&self, force_refresh: bool) -> Result<String, ProxyError> {
+        if let Ok(env_token) = std::env::var("GOOGLE_CLOUD_ACCESS_TOKEN") {
             return Ok(env_token);
         }
         if !force_refresh
@@ -196,17 +206,19 @@ impl GeminiAuth {
         if let Some(token) = self.try_metadata_server().await? {
             return Ok(token);
         }
-        Err(crate::error::ProxyError::Auth(
+        Err(ProxyError::Auth(
             "Could not find valid Gemini credentials. Please login using 'gemini login'.".into(),
         ))
     }
 
-    async fn try_load_from_files(
-        &self,
-        force_refresh: bool,
-    ) -> Result<Option<String>, crate::error::ProxyError> {
-        let mut paths: Vec<PathBuf> = vec![CONFIG.gemini_creds_path.clone()];
-        if let Ok(cred_path) = env::var("GOOGLE_APPLICATION_CREDENTIALS") {
+    async fn try_load_from_files(&self, force_refresh: bool) -> Result<Option<String>, ProxyError> {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        if let AccountAuth::GeminiOAuth { creds_path, .. } = &self.account.auth
+            && let Some(path) = creds_path.clone()
+        {
+            paths.push(path);
+        }
+        if let Ok(cred_path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
             paths.push(PathBuf::from(cred_path));
         }
         for path in paths {
@@ -250,21 +262,36 @@ impl GeminiAuth {
         Ok(None)
     }
 
-    async fn refresh_token(
-        &self,
-        creds: &OAuthCreds,
-        path: &Path,
-    ) -> Result<String, crate::error::ProxyError> {
-        info!("Refreshing access token from {}", path.display());
-        let client_id = creds.client_id.as_deref().unwrap_or(&CONFIG.client_id);
+    async fn refresh_token(&self, creds: &OAuthCreds, path: &Path) -> Result<String, ProxyError> {
+        info!(
+            "Refreshing access token for account {} from {}",
+            self.account.id,
+            path.display()
+        );
+        let (default_client_id, default_client_secret) = match &self.account.auth {
+            AccountAuth::GeminiOAuth {
+                client_id,
+                client_secret,
+                ..
+            } => (
+                client_id
+                    .clone()
+                    .unwrap_or_else(|| CONFIG.providers.gemini.default_client_id.clone()),
+                client_secret
+                    .clone()
+                    .unwrap_or_else(|| CONFIG.providers.gemini.default_client_secret.clone()),
+            ),
+            AccountAuth::ApiKey { .. } => unreachable!(),
+        };
+        let client_id = creds.client_id.as_deref().unwrap_or(&default_client_id);
         let client_secret = creds
             .client_secret
             .as_deref()
-            .unwrap_or(&CONFIG.client_secret);
+            .unwrap_or(&default_client_secret);
         let refresh_token = creds
             .refresh_token
             .as_deref()
-            .ok_or_else(|| crate::error::ProxyError::Auth("Missing refresh_token".into()))?;
+            .ok_or_else(|| ProxyError::Auth("Missing refresh_token".into()))?;
         let resp = self
             .client
             .post("https://oauth2.googleapis.com/token")
@@ -280,15 +307,15 @@ impl GeminiAuth {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(crate::error::ProxyError::Auth(format!(
+            return Err(ProxyError::Auth(format!(
                 "OAuth2 refresh failed ({}): {}",
                 status, body
             )));
         }
         let new_tokens: OAuthRefreshResponse = resp.json().await?;
-        let access_token = new_tokens.access_token.ok_or_else(|| {
-            crate::error::ProxyError::Auth("No access_token in refresh response".into())
-        })?;
+        let access_token = new_tokens
+            .access_token
+            .ok_or_else(|| ProxyError::Auth("No access_token in refresh response".into()))?;
         let expires_in = new_tokens.expires_in.unwrap_or(3600);
         let expiry_ms = now_ms() + expires_in * 1000;
         let mut cache = self.cache.lock().unwrap();
@@ -301,22 +328,27 @@ impl GeminiAuth {
         {
             data.access_token = Some(access_token.clone());
             data.expiry_date = Some(expiry_ms);
-            if let Ok(s) = serde_json::to_string_pretty(&data) {
-                if let Err(e) = fs::write(path, s) {
-                    warn!(
-                        "Could not save refreshed tokens to {}: {}",
-                        path.display(),
-                        e
-                    );
-                }
+            if let Ok(serialized) = serde_json::to_string_pretty(&data)
+                && let Err(e) = fs::write(path, serialized)
+            {
+                warn!(
+                    "Could not save refreshed tokens to {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
         Ok(access_token)
     }
 
-    async fn try_metadata_server(&self) -> Result<Option<String>, crate::error::ProxyError> {
-        let resp = self.client.get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
-            .header("Metadata-Flavor", "Google").timeout(std::time::Duration::from_secs(2)).send().await;
+    async fn try_metadata_server(&self) -> Result<Option<String>, ProxyError> {
+        let resp = self
+            .client
+            .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+            .header("Metadata-Flavor", "Google")
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await;
         match resp {
             Ok(r) if r.status().is_success() => {
                 let data: MetadataTokenResponse = r.json().await?;
@@ -335,13 +367,13 @@ impl GeminiAuth {
         Ok(None)
     }
 
-    async fn get_project_id(&self, token: &str) -> Result<String, crate::error::ProxyError> {
+    async fn get_project_id(&self, token: &str) -> Result<String, ProxyError> {
         if let Some(pid) = self.project_id_cache.lock().unwrap().as_ref() {
             return Ok(pid.clone());
         }
-        if let Some(pid) = env::var("GOOGLE_CLOUD_PROJECT")
+        if let Some(pid) = std::env::var("GOOGLE_CLOUD_PROJECT")
             .ok()
-            .or_else(|| env::var("GOOGLE_CLOUD_PROJECT_ID").ok())
+            .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT_ID").ok())
         {
             *self.project_id_cache.lock().unwrap() = Some(pid.clone());
             return Ok(pid);
@@ -362,11 +394,11 @@ impl GeminiAuth {
         Ok(pid)
     }
 
-    async fn fetch_project_info(
-        &self,
-        token: &str,
-    ) -> Result<LoadCodeAssistResponse, crate::error::ProxyError> {
-        let url = format!("{}/v1internal:loadCodeAssist", CONFIG.gemini_api_internal);
+    async fn fetch_project_info(&self, token: &str) -> Result<LoadCodeAssistResponse, ProxyError> {
+        let url = format!(
+            "{}/v1internal:loadCodeAssist",
+            CONFIG.providers.gemini.api_internal
+        );
         let body = LoadCodeAssistRequest {
             metadata: default_metadata(),
         };
@@ -383,12 +415,11 @@ impl GeminiAuth {
         Ok(resp.json().await?)
     }
 
-    async fn onboard_user(
-        &self,
-        token: &str,
-        tier_id: &str,
-    ) -> Result<String, crate::error::ProxyError> {
-        let url = format!("{}/v1internal:onboardUser", CONFIG.gemini_api_internal);
+    async fn onboard_user(&self, token: &str, tier_id: &str) -> Result<String, ProxyError> {
+        let url = format!(
+            "{}/v1internal:onboardUser",
+            CONFIG.providers.gemini.api_internal
+        );
         let body = OnboardUserRequest {
             tier_id,
             metadata: default_metadata(),
@@ -404,16 +435,17 @@ impl GeminiAuth {
             .await?
             .error_for_status()?;
         let operation: OnboardUserOperation = resp.json().await?;
-        let op_name = operation.name.as_deref().ok_or_else(|| {
-            crate::error::ProxyError::Auth("Onboarding failed: no operation name".into())
-        })?;
+        let op_name = operation
+            .name
+            .as_deref()
+            .ok_or_else(|| ProxyError::Auth("Onboarding failed: no operation name".into()))?;
         let result = self.poll_operation(token, op_name).await?;
         let pid = result
             .response
             .and_then(|r| r.cloudaicompanion_project)
             .and_then(|p| p.id)
             .ok_or_else(|| {
-                crate::error::ProxyError::Auth("Onboarding finished but no Project ID found".into())
+                ProxyError::Auth("Onboarding finished but no Project ID found".into())
             })?;
         Ok(pid)
     }
@@ -422,12 +454,15 @@ impl GeminiAuth {
         &self,
         token: &str,
         op_name: &str,
-    ) -> Result<PollOperationResponse, crate::error::ProxyError> {
-        let url = format!("{}/v1internal/{}", CONFIG.gemini_api_internal, op_name);
+    ) -> Result<PollOperationResponse, ProxyError> {
+        let url = format!(
+            "{}/v1internal/{}",
+            CONFIG.providers.gemini.api_internal, op_name
+        );
         let start = std::time::Instant::now();
         loop {
             if start.elapsed() > std::time::Duration::from_secs(60) {
-                return Err(crate::error::ProxyError::Auth("Operation timed out".into()));
+                return Err(ProxyError::Auth("Operation timed out".into()));
             }
             let resp = self
                 .client
@@ -440,7 +475,7 @@ impl GeminiAuth {
             let data: PollOperationResponse = resp.json().await?;
             if data.done {
                 if let Some(err) = &data.error {
-                    return Err(crate::error::ProxyError::Auth(format!(
+                    return Err(ProxyError::Auth(format!(
                         "Operation failed: {}",
                         serde_json::to_string(err).unwrap_or_default()
                     )));
