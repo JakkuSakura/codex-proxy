@@ -38,15 +38,12 @@ Example `~/.codex/config.toml` for using codex-proxy:
 ```toml
 model = "glm-5"
 model_provider = "codex-proxy"
-disable_response_storage = true
 personality = "pragmatic"
 service_tier = "fast"
 
 [model_providers.codex-proxy]
-name = "openai"
 base_url = "http://127.0.0.1:8765/v1"
 wire_api = "responses"
-api_key = "dummy"
 requires_openai_auth = false
 ```
 
