@@ -208,6 +208,10 @@ def run_server():
     server_address = (config.host, config.port)
     httpd = ThreadedHTTPServer(server_address, ProxyRequestHandler)
     logger.info(f"Listening on {config.host}:{config.port}")
+    logger.info(f"Config file: {config.config_path}")
+    logger.info(f"Log level: {config.log_level}")
+    logger.info(f"Debug mode: {config.debug_mode}")
+    logger.info(f"Config UI: http://{config.host}:{config.port}/config")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

@@ -45,7 +45,8 @@ def _validate_model_prefix(prefix: str) -> str:
 @dataclass
 class Config:
     # Server
-    host: str = "0.0.0.0"
+   host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = field(
         default_factory=lambda: _validate_port(
             os.environ.get("CODEX_PROXY_PORT", "8765")
