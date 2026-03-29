@@ -13,6 +13,7 @@ from .providers.zai import ZAIProvider
 from .normalizer import RequestNormalizer
 from .utils import json_loads
 from .validator import RequestValidator
+from . import ui as _ui
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,24 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 class ProxyRequestHandler(BaseHTTPRequestHandler):
     """Handles incoming Codex requests and routes them to appropriate providers."""
+
+    def do_GET(self):
+        if self.path in ("/", "/ui"):
+            body = _ui.get_html()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/config":
+            body = json.dumps(_ui.get_current_config()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404, "Not found")
 
     def do_POST(self):
         try:
