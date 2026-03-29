@@ -74,17 +74,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     """Handles incoming Codex requests and routes them to appropriate providers."""
 
     def do_GET(self):
-        if self.path in ("/", "/ui"):
+       if self.path in ("/", "/ui"):
+        if self.path in ("/", "/ui", "/config"):
             body = _ui.get_html()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path == "/config":
-            body = json.dumps(_ui.get_current_config()).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
