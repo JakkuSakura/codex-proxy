@@ -64,6 +64,7 @@ pub struct EffortLevel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileConfig {
+    pub host: Option<String>,
     pub port: Option<u16>,
     pub log_level: Option<String>,
     pub debug_mode: Option<bool>,
@@ -124,6 +125,9 @@ impl Config {
     }
 
     fn defaults() -> Self {
+        let host = env::var("CODEX_PROXY_HOST")
+            .unwrap_or_else(|_| "127.0.0.1".into());
+
         let port = env::var("CODEX_PROXY_PORT")
             .map(|p| validate_port(&p).unwrap_or(8765))
             .unwrap_or(8765);
@@ -160,7 +164,7 @@ impl Config {
         let home = dirs_home();
 
         Self {
-            host: "127.0.0.1".into(),
+            host,
             port,
             gemini_creds_path: home.join(".gemini/oauth_creds.json"),
             config_path: home.join(".config/codex-proxy/config.json"),
@@ -206,6 +210,8 @@ impl Config {
             }
         };
 
+        if env::var("CODEX_PROXY_HOST").is_err()
+            && let Some(ref host) = file_cfg.host { self.host = host.clone(); }
         if env::var("CODEX_PROXY_PORT").is_err()
             && let Some(port) = file_cfg.port { self.port = port; }
         if env::var("CODEX_PROXY_LOG_LEVEL").is_err()
