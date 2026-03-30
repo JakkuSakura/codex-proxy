@@ -12,7 +12,7 @@ use tracing::debug;
 pub struct RouteCandidate {
     pub requested_model: String,
     pub logical_model: String,
-    pub provider: crate::account_pool::AccountProvider,
+    pub provider: String,
     pub upstream_model: String,
     pub endpoint: Option<String>,
     pub reasoning: Option<EffectiveReasoningConfig>,
@@ -33,7 +33,7 @@ pub struct ResolvedRoute {
     pub logical_model: String,
     pub upstream_model: String,
     pub endpoint: Option<String>,
-    pub provider: crate::account_pool::AccountProvider,
+    pub provider: String,
     pub account_index: usize,
     pub account_id: String,
     pub cache_hit: bool,
@@ -44,7 +44,7 @@ pub struct ResolvedRoute {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StickyRouteBinding {
-    provider: crate::account_pool::AccountProvider,
+    provider: String,
     model: String,
     endpoint: Option<String>,
     account_index: usize,
@@ -66,7 +66,7 @@ impl RoutingState {
         self.sticky_bindings.write().insert(
             route.cache_key,
             StickyRouteBinding {
-                provider: route.provider,
+                provider: route.provider.clone(),
                 model: route.upstream_model.clone(),
                 endpoint: route.endpoint.clone(),
                 account_index: route.account_index,
@@ -135,7 +135,7 @@ impl Router {
                 Ok(RouteCandidate {
                     requested_model: requested_model.to_string(),
                     logical_model: logical_model.to_string(),
-                    provider: target.provider,
+                    provider: target.provider.clone(),
                     upstream_model: target.model.clone(),
                     endpoint: target.endpoint.clone(),
                     reasoning: reasoning_for(target)?,
@@ -189,7 +189,7 @@ impl Router {
         for candidate in candidates {
             let candidate_indices =
                 pool.healthy_compatible_accounts_for_target(&RouteTargetConfig {
-                    provider: candidate.provider,
+                    provider: candidate.provider.clone(),
                     model: candidate.upstream_model.clone(),
                     endpoint: candidate.endpoint.clone(),
                     reasoning: None,
@@ -257,7 +257,7 @@ impl Router {
             logical_model: candidate.logical_model.clone(),
             upstream_model: candidate.upstream_model.clone(),
             endpoint: candidate.endpoint.clone(),
-            provider: candidate.provider,
+            provider: candidate.provider.clone(),
             account_index: decision.account_index,
             account_id: account.id,
             cache_hit: decision.cache_hit,
@@ -271,18 +271,13 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account_pool::{Account, AccountAuth, AccountProvider};
+    use crate::account_pool::{Account, AccountAuth};
     use crate::schema::openai::ChatMessage;
 
-    fn account(
-        id: &str,
-        provider: AccountProvider,
-        models: Option<Vec<&str>>,
-        weight: u32,
-    ) -> Account {
+    fn account(id: &str, provider: &str, models: Option<Vec<&str>>, weight: u32) -> Account {
         Account {
             id: id.into(),
-            provider,
+            provider: provider.into(),
             auth: AccountAuth::ApiKey {
                 api_key: "test-key".into(),
             },
@@ -304,11 +299,11 @@ mod tests {
         }]
     }
 
-    fn candidate(priority_index: usize, provider: AccountProvider, model: &str) -> RouteCandidate {
+    fn candidate(priority_index: usize, provider: &str, model: &str) -> RouteCandidate {
         RouteCandidate {
             requested_model: "claude-sonnet-4-6".into(),
             logical_model: "claude-sonnet-4-6".into(),
-            provider,
+            provider: provider.into(),
             upstream_model: model.into(),
             endpoint: None,
             reasoning: None,
@@ -320,21 +315,21 @@ mod tests {
     fn prefers_first_healthy_candidate_in_order() {
         let pool = AccountPool::new();
         pool.load_accounts(vec![
-            account("zai", AccountProvider::Zai, Some(vec!["glm-4.6"]), 1),
-            account("openai", AccountProvider::OpenAi, Some(vec!["gpt-4.1"]), 1),
+            account("zai", "zai", Some(vec!["glm-4.6"]), 1),
+            account("openai", "openai", Some(vec!["gpt-4.1"]), 1),
         ]);
         let state = RoutingState::new();
         let route = Router::resolve_route(
             &pool,
             &state,
             &[
-                candidate(0, AccountProvider::OpenAi, "gpt-4.1"),
-                candidate(1, AccountProvider::Zai, "glm-4.6"),
+                candidate(0, "openai", "gpt-4.1"),
+                candidate(1, "zai", "glm-4.6"),
             ],
             &messages(),
         )
         .unwrap();
-        assert_eq!(route.provider, AccountProvider::OpenAi);
+        assert_eq!(route.provider, "openai");
         assert_eq!(route.upstream_model, "gpt-4.1");
     }
 
@@ -343,7 +338,7 @@ mod tests {
         let pool = AccountPool::new();
         pool.load_accounts(vec![account(
             "openai",
-            AccountProvider::OpenAi,
+            "openai",
             Some(vec!["gpt-4.1"]),
             1,
         )]);
@@ -351,7 +346,7 @@ mod tests {
         let first = Router::resolve_route(
             &pool,
             &state,
-            &[candidate(0, AccountProvider::OpenAi, "gpt-4.1")],
+            &[candidate(0, "openai", "gpt-4.1")],
             &messages(),
         )
         .unwrap();
@@ -360,7 +355,7 @@ mod tests {
         let second = Router::resolve_route(
             &pool,
             &state,
-            &[candidate(0, AccountProvider::OpenAi, "gpt-4.1")],
+            &[candidate(0, "openai", "gpt-4.1")],
             &messages(),
         )
         .unwrap();

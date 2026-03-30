@@ -40,10 +40,7 @@ impl ZAIProvider {
         context: &ProviderExecutionContext,
     ) -> Result<String, ProxyError> {
         CONFIG
-            .endpoint_url(
-                crate::account_pool::AccountProvider::Zai,
-                context.endpoint_name(),
-            )
+            .endpoint_url(context.provider(), context.endpoint_name())
             .map_err(ProxyError::Config)
     }
 
@@ -359,7 +356,10 @@ fn resolve_zai_auth(
 ) -> Result<String, ProxyError> {
     match &context.account.auth {
         AccountAuth::ApiKey { api_key } if !api_key.is_empty() => Ok(format!("Bearer {api_key}")),
-        _ if CONFIG.providers.zai.allow_authorization_passthrough => headers
+        _ if CONFIG
+            .zai_provider_config(context.provider())
+            .map_err(ProxyError::Config)?
+            .allow_authorization_passthrough => headers
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())

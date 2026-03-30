@@ -1,4 +1,4 @@
-use crate::account_pool::{Account, AccountProvider, ResolvedRoute};
+use crate::account_pool::{Account, ResolvedRoute};
 use crate::config::EffectiveReasoningConfig;
 use crate::error::ProxyError;
 use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
@@ -13,8 +13,8 @@ pub struct ProviderExecutionContext {
 }
 
 impl ProviderExecutionContext {
-    pub fn provider(&self) -> AccountProvider {
-        self.route.provider
+    pub fn provider(&self) -> &str {
+        &self.route.provider
     }
 
     pub fn upstream_model(&self) -> &str {

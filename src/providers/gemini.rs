@@ -75,13 +75,16 @@ impl GeminiProvider {
             tool_config,
         };
 
+        let provider_config = CONFIG
+            .gemini_provider_config(context.provider())
+            .map_err(ProxyError::Config)?;
         let (url, req_headers, body_field) = match &auth_ctx.auth_type {
             AuthType::Public => {
                 let key = auth_ctx.api_key.as_ref().unwrap();
                 (
                     format!(
                         "{}/v1beta/models/{model}:streamGenerateContent?alt=sse&key={key}",
-                        CONFIG.providers.gemini.api_public
+                        provider_config.api_public
                     ),
                     header::HeaderMap::new(),
                     GeminiBodyKind::Public,
@@ -98,7 +101,7 @@ impl GeminiProvider {
                 (
                     format!(
                         "{}/v1internal:streamGenerateContent?alt=sse",
-                        CONFIG.providers.gemini.api_internal
+                        provider_config.api_internal
                     ),
                     h,
                     GeminiBodyKind::Internal,
@@ -235,13 +238,16 @@ impl GeminiProvider {
             tool_config: None,
         };
 
+        let provider_config = CONFIG
+            .gemini_provider_config(context.provider())
+            .map_err(ProxyError::Config)?;
         let (url, req_headers, send_body) = match &auth_ctx.auth_type {
             AuthType::Public => {
                 let key = auth_ctx.api_key.as_ref().unwrap();
                 (
                     format!(
                         "{}/v1beta/models/{compaction_model}:streamGenerateContent?alt=sse&key={key}",
-                        CONFIG.providers.gemini.api_public
+                        provider_config.api_public
                     ),
                     header::HeaderMap::new(),
                     GeminiSendBody::Public(body),
@@ -255,7 +261,7 @@ impl GeminiProvider {
                 (
                     format!(
                         "{}/v1internal:streamGenerateContent?alt=sse",
-                        CONFIG.providers.gemini.api_internal
+                        provider_config.api_internal
                     ),
                     h,
                     GeminiSendBody::Internal(GeminiInternalBody {

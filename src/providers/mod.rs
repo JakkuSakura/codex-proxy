@@ -10,14 +10,14 @@ use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 
-use crate::account_pool::AccountProvider;
+use crate::config::{ProviderType, CONFIG};
 use base::Provider;
 use gemini::GeminiProvider;
 use openai::OpenAiProvider;
 use zai::ZAIProvider;
 
 struct RegistryInner {
-    providers: HashMap<AccountProvider, Box<dyn Provider + Send + Sync>>,
+    providers: HashMap<ProviderType, Box<dyn Provider + Send + Sync>>,
 }
 
 static REGISTRY: Lazy<RwLock<RegistryInner>> = Lazy::new(|| {
@@ -30,22 +30,25 @@ pub fn initialize_registry() {
     let mut reg = REGISTRY.write();
     reg.providers.clear();
     reg.providers
-        .insert(AccountProvider::Gemini, Box::new(GeminiProvider::new()));
+        .insert(ProviderType::Gemini, Box::new(GeminiProvider::new()));
     reg.providers
-        .insert(AccountProvider::Zai, Box::new(ZAIProvider::new()));
+        .insert(ProviderType::Zai, Box::new(ZAIProvider::new()));
     reg.providers
-        .insert(AccountProvider::OpenAi, Box::new(OpenAiProvider::new()));
+        .insert(ProviderType::OpenAi, Box::new(OpenAiProvider::new()));
 }
 
-pub fn get_provider(provider: AccountProvider) -> Box<dyn Provider + Send + Sync> {
-    REGISTRY
-        .read()
-        .providers
-        .get(&provider)
-        .map(|provider| provider.clone_box())
-        .unwrap_or_else(|| match provider {
-            AccountProvider::Gemini => Box::new(GeminiProvider::new()),
-            AccountProvider::Zai => Box::new(ZAIProvider::new()),
-            AccountProvider::OpenAi => Box::new(OpenAiProvider::new()),
-        })
+pub fn get_provider(provider_name: &str) -> Box<dyn Provider + Send + Sync> {
+    let provider_type = CONFIG
+        .provider_type(provider_name)
+        .expect("provider referenced by route/account must exist in config");
+
+    if let Some(provider) = REGISTRY.read().providers.get(&provider_type) {
+        return provider.clone_box();
+    }
+
+    match provider_type {
+        ProviderType::Gemini => Box::new(GeminiProvider::new()),
+        ProviderType::Zai => Box::new(ZAIProvider::new()),
+        ProviderType::OpenAi => Box::new(OpenAiProvider::new()),
+    }
 }

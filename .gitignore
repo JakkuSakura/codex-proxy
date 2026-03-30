@@ -215,3 +215,6 @@ secrets.json
 # Added by cargo
 
 /target
+
+# Local config overlays (secrets)
+*.local

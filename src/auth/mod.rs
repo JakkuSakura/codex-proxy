@@ -268,6 +268,9 @@ impl GeminiAuth {
             self.account.id,
             path.display()
         );
+        let provider_cfg = CONFIG
+            .gemini_provider_config(&self.account.provider)
+            .map_err(ProxyError::Config)?;
         let (default_client_id, default_client_secret) = match &self.account.auth {
             AccountAuth::GeminiOAuth {
                 client_id,
@@ -276,10 +279,10 @@ impl GeminiAuth {
             } => (
                 client_id
                     .clone()
-                    .unwrap_or_else(|| CONFIG.providers.gemini.default_client_id.clone()),
+                    .unwrap_or_else(|| provider_cfg.default_client_id.clone()),
                 client_secret
                     .clone()
-                    .unwrap_or_else(|| CONFIG.providers.gemini.default_client_secret.clone()),
+                    .unwrap_or_else(|| provider_cfg.default_client_secret.clone()),
             ),
             AccountAuth::ApiKey { .. } => unreachable!(),
         };
@@ -397,7 +400,10 @@ impl GeminiAuth {
     async fn fetch_project_info(&self, token: &str) -> Result<LoadCodeAssistResponse, ProxyError> {
         let url = format!(
             "{}/v1internal:loadCodeAssist",
-            CONFIG.providers.gemini.api_internal
+            CONFIG
+                .gemini_provider_config(&self.account.provider)
+                .map_err(ProxyError::Config)?
+                .api_internal
         );
         let body = LoadCodeAssistRequest {
             metadata: default_metadata(),
@@ -418,7 +424,10 @@ impl GeminiAuth {
     async fn onboard_user(&self, token: &str, tier_id: &str) -> Result<String, ProxyError> {
         let url = format!(
             "{}/v1internal:onboardUser",
-            CONFIG.providers.gemini.api_internal
+            CONFIG
+                .gemini_provider_config(&self.account.provider)
+                .map_err(ProxyError::Config)?
+                .api_internal
         );
         let body = OnboardUserRequest {
             tier_id,
@@ -457,7 +466,11 @@ impl GeminiAuth {
     ) -> Result<PollOperationResponse, ProxyError> {
         let url = format!(
             "{}/v1internal/{}",
-            CONFIG.providers.gemini.api_internal, op_name
+            CONFIG
+                .gemini_provider_config(&self.account.provider)
+                .map_err(ProxyError::Config)?
+                .api_internal,
+            op_name
         );
         let start = std::time::Instant::now();
         loop {

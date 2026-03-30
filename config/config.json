@@ -1,0 +1,82 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "log_level": "DEBUG",
+    "debug_mode": true
+  },
+  "providers": {
+    "gemini": {
+      "api_internal": "https://cloudcode-pa.googleapis.com",
+      "api_public": "https://generativelanguage.googleapis.com",
+      "default_client_id": "",
+      "default_client_secret": "",
+      "models": []
+    },
+    "zai": {
+      "api_url": "https://api.z.ai/api/coding/paas/v4/chat/completions",
+      "endpoints": {},
+      "allow_authorization_passthrough": false,
+      "models": []
+    },
+    "openai": {
+      "endpoints": {},
+      "models": [],
+      "api_url": "https://api.openai.com/v1/responses"
+    }
+  },
+  "models": {
+    "served": [],
+    "fallback_models": {}
+  },
+  "routing": {
+    "model_overrides": {},
+    "preferred_models": {},
+    "sticky_routing": {
+      "enabled": true
+    },
+    "health": {
+      "auth_failure_immediate_unhealthy": true,
+      "failure_threshold": 3,
+      "cooldown_seconds": 30
+    }
+  },
+  "accounts": [],
+  "reasoning": {
+    "effort_levels": {
+      "none": {
+        "budget": 0,
+        "level": "LOW"
+      },
+      "minimal": {
+        "budget": 2048,
+        "level": "LOW"
+      },
+      "low": {
+        "budget": 4096,
+        "level": "LOW"
+      },
+      "medium": {
+        "budget": 16384,
+        "level": "MEDIUM"
+      },
+      "high": {
+        "budget": 32768,
+        "level": "HIGH"
+      },
+      "xhigh": {
+        "budget": 65536,
+        "level": "HIGH"
+      }
+    },
+    "default_effort": "medium"
+  },
+  "timeouts": {
+    "connect_seconds": 10,
+    "read_seconds": 600
+  },
+  "compaction": {
+    "temperature": 0.1,
+    "preferred_targets": []
+  }
+}

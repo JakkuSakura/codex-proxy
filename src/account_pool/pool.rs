@@ -7,42 +7,6 @@ use std::time::{Duration, SystemTime};
 use crate::config::{AccountConfig, RouteTargetConfig, RoutingHealthConfig};
 use tracing::{debug, info, warn};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AccountProvider {
-    Gemini,
-    Zai,
-    OpenAi,
-}
-
-impl AccountProvider {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AccountProvider::Gemini => "gemini",
-            AccountProvider::Zai => "zai",
-            AccountProvider::OpenAi => "openai",
-        }
-    }
-}
-
-impl std::fmt::Display for AccountProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for AccountProvider {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "gemini" => Ok(AccountProvider::Gemini),
-            "zai" => Ok(AccountProvider::Zai),
-            "openai" => Ok(AccountProvider::OpenAi),
-            _ => Err(format!("unknown provider: {s}")),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AccountAuth {
@@ -62,7 +26,7 @@ pub enum AccountAuth {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
-    pub provider: AccountProvider,
+    pub provider: String,
     pub auth: AccountAuth,
     #[serde(default)]
     pub enabled: bool,
@@ -334,7 +298,7 @@ impl AccountPool {
                 let state = state.read();
                 AccountStatus {
                     id: account.id.clone(),
-                    provider: account.provider,
+                    provider: account.provider.clone(),
                     models: account.models.clone(),
                     weight: account.weight,
                     auth: mask_auth(&account.auth),
@@ -381,7 +345,7 @@ pub struct MaskedAccountAuth {
 #[derive(Debug, Clone, Serialize)]
 pub struct AccountStatus {
     pub id: String,
-    pub provider: AccountProvider,
+    pub provider: String,
     pub models: Option<Vec<String>>,
     pub weight: u32,
     pub auth: MaskedAccountAuth,
@@ -428,15 +392,10 @@ fn mask_key(key: &str) -> String {
 mod tests {
     use super::*;
 
-    fn account(
-        id: &str,
-        provider: AccountProvider,
-        models: Option<Vec<&str>>,
-        weight: u32,
-    ) -> Account {
+    fn account(id: &str, provider: &str, models: Option<Vec<&str>>, weight: u32) -> Account {
         Account {
             id: id.into(),
-            provider,
+            provider: provider.into(),
             auth: AccountAuth::ApiKey {
                 api_key: "test-key".into(),
             },
@@ -446,9 +405,9 @@ mod tests {
         }
     }
 
-    fn target(provider: AccountProvider, model: &str) -> RouteTargetConfig {
+    fn target(provider: &str, model: &str) -> RouteTargetConfig {
         RouteTargetConfig {
-            provider,
+            provider: provider.into(),
             model: model.into(),
             endpoint: None,
             reasoning: None,
@@ -459,19 +418,18 @@ mod tests {
     fn filters_accounts_by_model_capability() {
         let pool = AccountPool::new();
         pool.load_accounts(vec![
-            account("a", AccountProvider::OpenAi, Some(vec!["gpt-4.1"]), 1),
-            account("b", AccountProvider::OpenAi, Some(vec!["gpt-4.1-mini"]), 1),
+            account("a", "openai", Some(vec!["gpt-4.1"]), 1),
+            account("b", "openai", Some(vec!["gpt-4.1-mini"]), 1),
         ]);
 
-        let compatible = pool
-            .healthy_compatible_accounts_for_target(&target(AccountProvider::OpenAi, "gpt-4.1"));
+        let compatible = pool.healthy_compatible_accounts_for_target(&target("openai", "gpt-4.1"));
         assert_eq!(compatible, vec![0]);
     }
 
     #[test]
     fn marks_account_unhealthy_on_first_failure() {
         let pool = AccountPool::new();
-        pool.load_accounts(vec![account("a", AccountProvider::OpenAi, None, 1)]);
+        pool.load_accounts(vec![account("a", "openai", None, 1)]);
         pool.mark_failure(0, false);
         let (_, snapshot) = pool.get_account(0).unwrap();
         assert!(!snapshot.alive);

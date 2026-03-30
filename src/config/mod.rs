@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-use crate::account_pool::{AccountAuth, AccountProvider};
+use crate::account_pool::AccountAuth;
 use crate::error::ConfigError;
 
 pub const GEMINI_CLI_CLIENT_ID: &str =
@@ -123,6 +123,24 @@ pub struct ServerConfig {
     pub debug_mode: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderType {
+    Gemini,
+    Zai,
+    OpenAi,
+}
+
+impl std::fmt::Display for ProviderType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ProviderType::Gemini => "gemini",
+            ProviderType::Zai => "zai",
+            ProviderType::OpenAi => "openai",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiProviderConfig {
     pub api_internal: String,
@@ -146,7 +164,7 @@ pub struct ZaiProviderConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiProviderConfig {
-    pub responses_url: String,
+    pub api_url: String,
     #[serde(default)]
     pub endpoints: HashMap<String, String>,
     #[serde(default)]
@@ -154,11 +172,148 @@ pub struct OpenAiProviderConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProvidersConfig {
-    pub gemini: GeminiProviderConfig,
-    pub zai: ZaiProviderConfig,
-    pub openai: OpenAiProviderConfig,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderConfig {
+    Gemini {
+        api_internal: String,
+        api_public: String,
+        default_client_id: String,
+        default_client_secret: String,
+        #[serde(default)]
+        models: Vec<String>,
+    },
+    Zai {
+        api_url: String,
+        #[serde(default)]
+        endpoints: HashMap<String, String>,
+        #[serde(default)]
+        allow_authorization_passthrough: bool,
+        #[serde(default)]
+        models: Vec<String>,
+    },
+    OpenAi {
+        api_url: String,
+        #[serde(default)]
+        endpoints: HashMap<String, String>,
+        #[serde(default)]
+        models: Vec<String>,
+    },
 }
+
+impl ProviderConfig {
+    pub fn provider_type(&self) -> ProviderType {
+        match self {
+            ProviderConfig::Gemini { .. } => ProviderType::Gemini,
+            ProviderConfig::Zai { .. } => ProviderType::Zai,
+            ProviderConfig::OpenAi { .. } => ProviderType::OpenAi,
+        }
+    }
+
+    pub fn models(&self) -> &Vec<String> {
+        match self {
+            ProviderConfig::Gemini { models, .. }
+            | ProviderConfig::Zai { models, .. }
+            | ProviderConfig::OpenAi { models, .. } => models,
+        }
+    }
+
+    pub fn as_gemini(&self) -> Option<GeminiProviderConfig> {
+        match self {
+            ProviderConfig::Gemini {
+                api_internal,
+                api_public,
+                default_client_id,
+                default_client_secret,
+                models,
+            } => Some(GeminiProviderConfig {
+                api_internal: api_internal.clone(),
+                api_public: api_public.clone(),
+                default_client_id: default_client_id.clone(),
+                default_client_secret: default_client_secret.clone(),
+                models: models.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn as_zai(&self) -> Option<ZaiProviderConfig> {
+        match self {
+            ProviderConfig::Zai {
+                api_url,
+                endpoints,
+                allow_authorization_passthrough,
+                models,
+            } => Some(ZaiProviderConfig {
+                api_url: api_url.clone(),
+                endpoints: endpoints.clone(),
+                allow_authorization_passthrough: *allow_authorization_passthrough,
+                models: models.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn endpoint_url(&self, provider_name: &str, endpoint: Option<&str>) -> Result<String, ConfigError> {
+        match self {
+            ProviderConfig::Gemini { api_public, .. } => match endpoint {
+                Some(name) => Err(ConfigError::InvalidValue(format!(
+                    "Provider '{}' of type gemini does not support named endpoints in route targets: {}",
+                    provider_name, name
+                ))),
+                None => Ok(api_public.clone()),
+            },
+            ProviderConfig::OpenAi {
+                api_url,
+                endpoints,
+                ..
+            }
+            | ProviderConfig::Zai {
+                api_url,
+                endpoints,
+                ..
+            } => match endpoint {
+                Some(name) => endpoints.get(name).cloned().ok_or_else(|| {
+                    ConfigError::InvalidValue(format!(
+                        "Unknown endpoint '{}' referenced by provider '{}'",
+                        name, provider_name
+                    ))
+                }),
+                None => Ok(api_url.clone()),
+            },
+        }
+    }
+
+    pub fn validate(&self, provider_name: &str) -> Result<(), ConfigError> {
+        match self {
+            ProviderConfig::Gemini {
+                api_internal,
+                api_public,
+                ..
+            } => {
+                validate_url(api_internal, &format!("Provider '{}' gemini api_internal", provider_name))?;
+                validate_url(api_public, &format!("Provider '{}' gemini api_public", provider_name))?;
+            }
+            ProviderConfig::Zai {
+                api_url,
+                endpoints,
+                ..
+            }
+            | ProviderConfig::OpenAi {
+                api_url,
+                endpoints,
+                ..
+            } => {
+                validate_url(api_url, &format!("Provider '{}' api_url", provider_name))?;
+                for (name, url) in endpoints {
+                    validate_url(url, &format!("Provider '{}' endpoint '{}'", provider_name, name))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub type ProvidersConfig = HashMap<String, ProviderConfig>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelsConfig {
@@ -170,7 +325,7 @@ pub struct ModelsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteTargetConfig {
-    pub provider: AccountProvider,
+    pub provider: String,
     pub model: String,
     #[serde(default)]
     pub endpoint: Option<String>,
@@ -231,7 +386,7 @@ pub struct CompactionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountConfig {
     pub id: String,
-    pub provider: AccountProvider,
+    pub provider: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_weight")]
@@ -309,7 +464,8 @@ impl Config {
             .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".into());
         let z_ai_url = env::var("CODEX_PROXY_ZAI_URL")
             .unwrap_or_else(|_| "https://api.z.ai/api/coding/paas/v4/chat/completions".into());
-        let openai_responses_url = env::var("CODEX_PROXY_OPENAI_RESPONSES_URL")
+        let openai_api_url = env::var("CODEX_PROXY_OPENAI_API_URL")
+            .or_else(|_| env::var("CODEX_PROXY_OPENAI_RESPONSES_URL"))
             .unwrap_or_else(|_| "https://api.openai.com/v1/responses".into());
 
         let served_models: Vec<String> = env::var("CODEX_PROXY_MODELS")
@@ -330,7 +486,7 @@ impl Config {
         {
             accounts.push(AccountConfig {
                 id: "gemini-default".into(),
-                provider: AccountProvider::Gemini,
+                provider: "gemini".into(),
                 enabled: true,
                 weight: 1,
                 models: None,
@@ -342,7 +498,7 @@ impl Config {
         {
             accounts.push(AccountConfig {
                 id: "zai-default".into(),
-                provider: AccountProvider::Zai,
+                provider: "zai".into(),
                 enabled: true,
                 weight: 1,
                 models: None,
@@ -354,7 +510,7 @@ impl Config {
         {
             accounts.push(AccountConfig {
                 id: "openai-default".into(),
-                provider: AccountProvider::OpenAi,
+                provider: "openai".into(),
                 enabled: true,
                 weight: 1,
                 models: None,
@@ -367,7 +523,7 @@ impl Config {
                 .unwrap_or_else(|_| home.join(".gemini/oauth_creds.json"));
             accounts.push(AccountConfig {
                 id: "gemini-oauth".into(),
-                provider: AccountProvider::Gemini,
+                provider: "gemini".into(),
                 enabled: true,
                 weight: 1,
                 models: None,
@@ -379,35 +535,44 @@ impl Config {
             });
         }
 
+        let mut providers = HashMap::new();
+        providers.insert(
+            "gemini".into(),
+            ProviderConfig::Gemini {
+                api_internal: validate_url(&gemini_api_internal, "Gemini internal").unwrap(),
+                api_public: validate_url(&gemini_api_public, "Gemini public").unwrap(),
+                default_client_id: gemini_client_id,
+                default_client_secret: gemini_client_secret,
+                models: Vec::new(),
+            },
+        );
+        providers.insert(
+            "zai".into(),
+            ProviderConfig::Zai {
+                api_url: validate_url(&z_ai_url, "Z.AI URL").unwrap(),
+                endpoints: HashMap::new(),
+                allow_authorization_passthrough: false,
+                models: Vec::new(),
+            },
+        );
+        providers.insert(
+            "openai".into(),
+            ProviderConfig::OpenAi {
+                api_url: validate_url(&openai_api_url, "OpenAI API URL").unwrap(),
+                endpoints: HashMap::new(),
+                models: Vec::new(),
+            },
+        );
+
         Self {
-            config_path: home.join(".config/codex-proxy/config.json"),
+            config_path: default_config_search_paths(&home)[0].clone(),
             server: ServerConfig {
                 host,
                 port,
                 log_level,
                 debug_mode,
             },
-            providers: ProvidersConfig {
-                gemini: GeminiProviderConfig {
-                    api_internal: validate_url(&gemini_api_internal, "Gemini internal").unwrap(),
-                    api_public: validate_url(&gemini_api_public, "Gemini public").unwrap(),
-                    default_client_id: gemini_client_id,
-                    default_client_secret: gemini_client_secret,
-                    models: Vec::new(),
-                },
-                zai: ZaiProviderConfig {
-                    api_url: validate_url(&z_ai_url, "Z.AI URL").unwrap(),
-                    endpoints: HashMap::new(),
-                    allow_authorization_passthrough: false,
-                    models: Vec::new(),
-                },
-                openai: OpenAiProviderConfig {
-                    responses_url: validate_url(&openai_responses_url, "OpenAI responses URL")
-                        .unwrap(),
-                    endpoints: HashMap::new(),
-                    models: Vec::new(),
-                },
-            },
+            providers,
             models: ModelsConfig {
                 served: served_models,
                 fallback_models: HashMap::new(),
@@ -432,70 +597,69 @@ impl Config {
     }
 
     fn load_from_file(&mut self) {
-        if !self.config_path.exists() {
+        for path in default_config_search_paths(&dirs_home()) {
+            if !path.exists() {
+                continue;
+            }
+            let content = match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to read config {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+            let file_cfg: FileConfig = match serde_json::from_str(&content) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    warn!("Failed to parse config {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+
+            if let Some(server) = file_cfg.server {
+                self.server = server;
+            }
+            if let Some(providers) = file_cfg.providers {
+                self.providers = providers;
+            }
+            if let Some(models) = file_cfg.models {
+                self.models = models;
+            }
+            if let Some(routing) = file_cfg.routing {
+                self.routing = routing;
+            }
+            if let Some(accounts) = file_cfg.accounts {
+                self.accounts = accounts;
+            }
+            if let Some(reasoning) = file_cfg.reasoning {
+                self.reasoning = reasoning;
+            }
+            if let Some(timeouts) = file_cfg.timeouts {
+                self.timeouts = timeouts;
+            }
+            if let Some(compaction) = file_cfg.compaction {
+                self.compaction = compaction;
+            }
+
+            self.config_path = path.clone();
+            info!("Loaded config from {}", self.config_path.display());
             return;
         }
-        let content = match fs::read_to_string(&self.config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    "Failed to read config {}: {}",
-                    self.config_path.display(),
-                    e
-                );
-                return;
-            }
-        };
-        let file_cfg: FileConfig = match serde_json::from_str(&content) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                warn!(
-                    "Failed to parse config {}: {}",
-                    self.config_path.display(),
-                    e
-                );
-                return;
-            }
-        };
-
-        if let Some(server) = file_cfg.server {
-            self.server = server;
-        }
-        if let Some(providers) = file_cfg.providers {
-            self.providers = providers;
-        }
-        if let Some(models) = file_cfg.models {
-            self.models = models;
-        }
-        if let Some(routing) = file_cfg.routing {
-            self.routing = routing;
-        }
-        if let Some(accounts) = file_cfg.accounts {
-            self.accounts = accounts;
-        }
-        if let Some(reasoning) = file_cfg.reasoning {
-            self.reasoning = reasoning;
-        }
-        if let Some(timeouts) = file_cfg.timeouts {
-            self.timeouts = timeouts;
-        }
-        if let Some(compaction) = file_cfg.compaction {
-            self.compaction = compaction;
-        }
-
-        info!("Loaded config from {}", self.config_path.display());
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_url(&self.providers.gemini.api_internal, "Gemini internal")?;
-        validate_url(&self.providers.gemini.api_public, "Gemini public")?;
-        validate_url(&self.providers.zai.api_url, "Z.AI URL")?;
-        validate_url(&self.providers.openai.responses_url, "OpenAI responses URL")?;
-        for (name, url) in &self.providers.zai.endpoints {
-            validate_url(url, &format!("Z.AI endpoint '{name}'"))?;
+        if self.providers.is_empty() {
+            return Err(ConfigError::InvalidValue(
+                "providers must contain at least one provider entry".into(),
+            ));
         }
-        for (name, url) in &self.providers.openai.endpoints {
-            validate_url(url, &format!("OpenAI endpoint '{name}'"))?;
+        for (provider_name, provider) in &self.providers {
+            if provider_name.trim().is_empty() {
+                return Err(ConfigError::InvalidValue(
+                    "providers contains an empty provider name".into(),
+                ));
+            }
+            provider.validate(provider_name)?;
         }
 
         if self.server.port == 0 {
@@ -511,8 +675,7 @@ impl Config {
         }
 
         let mut seen_ids = HashSet::new();
-        let enabled_accounts: Vec<&AccountConfig> =
-            self.accounts.iter().filter(|a| a.enabled).collect();
+        let enabled_accounts: Vec<&AccountConfig> = self.accounts.iter().filter(|a| a.enabled).collect();
         if enabled_accounts.is_empty() {
             return Err(ConfigError::InvalidValue(
                 "accounts must contain at least one enabled account".into(),
@@ -525,8 +688,10 @@ impl Config {
                     account.id
                 )));
             }
-            match (&account.provider, &account.auth) {
-                (AccountProvider::Gemini, AccountAuth::ApiKey { api_key }) => {
+
+            let provider_type = self.provider_type(&account.provider)?;
+            match (provider_type, &account.auth) {
+                (ProviderType::Gemini, AccountAuth::ApiKey { api_key }) => {
                     if api_key.is_empty() {
                         return Err(ConfigError::InvalidValue(format!(
                             "account '{}' has empty api_key auth",
@@ -535,7 +700,7 @@ impl Config {
                     }
                 }
                 (
-                    AccountProvider::Gemini,
+                    ProviderType::Gemini,
                     AccountAuth::GeminiOAuth {
                         creds_path,
                         client_id,
@@ -549,8 +714,7 @@ impl Config {
                         )));
                     }
                 }
-                (AccountProvider::Zai, AccountAuth::ApiKey { api_key })
-                | (AccountProvider::OpenAi, AccountAuth::ApiKey { api_key }) => {
+                (ProviderType::Zai | ProviderType::OpenAi, AccountAuth::ApiKey { api_key }) => {
                     if api_key.is_empty() {
                         return Err(ConfigError::InvalidValue(format!(
                             "account '{}' has empty api_key auth",
@@ -558,10 +722,10 @@ impl Config {
                         )));
                     }
                 }
-                (provider, auth) => {
+                (provider_type, auth) => {
                     return Err(ConfigError::InvalidValue(format!(
-                        "account '{}' has invalid auth {:?} for provider {}",
-                        account.id, auth, provider
+                        "account '{}' has invalid auth {:?} for provider '{}' (type {})",
+                        account.id, auth, account.provider, provider_type
                     )));
                 }
             }
@@ -573,11 +737,11 @@ impl Config {
                         account.id
                     )));
                 }
-                if let Some(provider_models) = self.provider_catalog(account.provider) {
+                if let Some(provider_models) = self.provider_catalog(&account.provider) {
                     for model in models {
                         if !provider_models.contains(model) {
                             return Err(ConfigError::InvalidValue(format!(
-                                "account '{}' references model '{}' not present in provider {} catalog",
+                                "account '{}' references model '{}' not present in provider '{}' catalog",
                                 account.id, model, account.provider
                             )));
                         }
@@ -653,10 +817,7 @@ impl Config {
             .unwrap_or_else(|| requested_model.to_string())
     }
 
-    pub fn preferred_targets_for_model(
-        &self,
-        requested_model: &str,
-    ) -> Option<&[RouteTargetConfig]> {
+    pub fn preferred_targets_for_model(&self, requested_model: &str) -> Option<&[RouteTargetConfig]> {
         let logical_model = self.resolve_logical_model(requested_model);
         self.routing
             .preferred_models
@@ -729,72 +890,62 @@ impl Config {
         }))
     }
 
-    pub fn provider_catalog(&self, provider: AccountProvider) -> Option<&Vec<String>> {
-        let models = match provider {
-            AccountProvider::Gemini => &self.providers.gemini.models,
-            AccountProvider::Zai => &self.providers.zai.models,
-            AccountProvider::OpenAi => &self.providers.openai.models,
-        };
+    pub fn provider_type(&self, provider: &str) -> Result<ProviderType, ConfigError> {
+        self.providers
+            .get(provider)
+            .map(ProviderConfig::provider_type)
+            .ok_or_else(|| ConfigError::InvalidValue(format!("Unknown provider '{}'", provider)))
+    }
+
+    pub fn provider_catalog(&self, provider: &str) -> Option<&Vec<String>> {
+        let models = self.providers.get(provider)?.models();
         (!models.is_empty()).then_some(models)
     }
 
-    pub fn endpoint_url(
-        &self,
-        provider: AccountProvider,
-        endpoint: Option<&str>,
-    ) -> Result<String, ConfigError> {
-        match provider {
-            AccountProvider::Gemini => match endpoint {
-                Some(name) => Err(ConfigError::InvalidValue(format!(
-                    "Gemini does not support named endpoints in route targets: {}",
-                    name
-                ))),
-                None => Ok(self.providers.gemini.api_public.clone()),
-            },
-            AccountProvider::OpenAi => match endpoint {
-                Some(name) => self
-                    .providers
-                    .openai
-                    .endpoints
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| {
-                        ConfigError::InvalidValue(format!(
-                            "Unknown OpenAI endpoint '{}' referenced by route target",
-                            name
-                        ))
-                    }),
-                None => Ok(self.providers.openai.responses_url.clone()),
-            },
-            AccountProvider::Zai => match endpoint {
-                Some(name) => self
-                    .providers
-                    .zai
-                    .endpoints
-                    .get(name)
-                    .cloned()
-                    .ok_or_else(|| {
-                        ConfigError::InvalidValue(format!(
-                            "Unknown Z.AI endpoint '{}' referenced by route target",
-                            name
-                        ))
-                    }),
-                None => Ok(self.providers.zai.api_url.clone()),
-            },
-        }
+    pub fn endpoint_url(&self, provider: &str, endpoint: Option<&str>) -> Result<String, ConfigError> {
+        self.providers
+            .get(provider)
+            .ok_or_else(|| ConfigError::InvalidValue(format!("Unknown provider '{}'", provider)))?
+            .endpoint_url(provider, endpoint)
     }
 
-    fn validate_route_target(
-        &self,
-        target: &RouteTargetConfig,
-        scope: &str,
-    ) -> Result<(), ConfigError> {
+    pub fn gemini_provider_config(&self, provider: &str) -> Result<GeminiProviderConfig, ConfigError> {
+        self.providers
+            .get(provider)
+            .and_then(ProviderConfig::as_gemini)
+            .ok_or_else(|| {
+                ConfigError::InvalidValue(format!(
+                    "Provider '{}' is not configured as type gemini",
+                    provider
+                ))
+            })
+    }
+
+    pub fn zai_provider_config(&self, provider: &str) -> Result<ZaiProviderConfig, ConfigError> {
+        self.providers
+            .get(provider)
+            .and_then(ProviderConfig::as_zai)
+            .ok_or_else(|| {
+                ConfigError::InvalidValue(format!(
+                    "Provider '{}' is not configured as type zai",
+                    provider
+                ))
+            })
+    }
+
+    fn validate_route_target(&self, target: &RouteTargetConfig, scope: &str) -> Result<(), ConfigError> {
+        if target.provider.trim().is_empty() {
+            return Err(ConfigError::InvalidValue(format!(
+                "{scope} contains an empty provider name"
+            )));
+        }
         if target.model.trim().is_empty() {
             return Err(ConfigError::InvalidValue(format!(
                 "{scope} contains an empty target model"
             )));
         }
-        if let Some(provider_models) = self.provider_catalog(target.provider)
+        self.provider_type(&target.provider)?;
+        if let Some(provider_models) = self.provider_catalog(&target.provider)
             && !provider_models.contains(&target.model)
         {
             return Err(ConfigError::InvalidValue(format!(
@@ -803,7 +954,7 @@ impl Config {
             )));
         }
         self.resolve_reasoning(target.reasoning.as_ref())?;
-        self.endpoint_url(target.provider, target.endpoint.as_deref())?;
+        self.endpoint_url(&target.provider, target.endpoint.as_deref())?;
         Ok(())
     }
 
@@ -820,6 +971,14 @@ impl Config {
             })
         })
     }
+}
+
+fn default_config_search_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
+        PathBuf::from("config/config.json.local"),
+        home.join(".config/codex-proxy/config.json"),
+        PathBuf::from("config/config.json"),
+    ]
 }
 
 fn default_true() -> bool {
@@ -861,29 +1020,46 @@ mod tests {
                 log_level: "INFO".into(),
                 debug_mode: false,
             },
-            providers: ProvidersConfig {
-                gemini: GeminiProviderConfig {
-                    api_internal: "https://internal.example.com".into(),
-                    api_public: "https://public.example.com".into(),
-                    default_client_id: "id".into(),
-                    default_client_secret: "secret".into(),
-                    models: vec!["gemini-2.5-pro".into()],
-                },
-                zai: ZaiProviderConfig {
-                    api_url: "https://z.ai/chat".into(),
-                    endpoints: HashMap::from([("fast".into(), "https://z.ai/fast".into())]),
-                    allow_authorization_passthrough: false,
-                    models: vec!["glm-4.6".into()],
-                },
-                openai: OpenAiProviderConfig {
-                    responses_url: "https://api.openai.com/v1/responses".into(),
-                    endpoints: HashMap::from([(
-                        "priority".into(),
-                        "https://priority.openai.com/v1/responses".into(),
-                    )]),
-                    models: vec!["gpt-4.1".into(), "gpt-4.1-mini".into()],
-                },
-            },
+            providers: HashMap::from([
+                (
+                    "gemini".into(),
+                    ProviderConfig::Gemini {
+                        api_internal: "https://internal.example.com".into(),
+                        api_public: "https://public.example.com".into(),
+                        default_client_id: "id".into(),
+                        default_client_secret: "secret".into(),
+                        models: vec!["gemini-2.5-pro".into()],
+                    },
+                ),
+                (
+                    "zai".into(),
+                    ProviderConfig::Zai {
+                        api_url: "https://z.ai/chat".into(),
+                        endpoints: HashMap::from([("fast".into(), "https://z.ai/fast".into())]),
+                        allow_authorization_passthrough: false,
+                        models: vec!["glm-4.6".into()],
+                    },
+                ),
+                (
+                    "openai".into(),
+                    ProviderConfig::OpenAi {
+                        api_url: "https://api.openai.com/v1/responses".into(),
+                        endpoints: HashMap::from([(
+                            "priority".into(),
+                            "https://priority.openai.com/v1/responses".into(),
+                        )]),
+                        models: vec!["gpt-4.1".into(), "gpt-4.1-mini".into()],
+                    },
+                ),
+                (
+                    "tabcode".into(),
+                    ProviderConfig::OpenAi {
+                        api_url: "https://tabcode.example/v1/responses".into(),
+                        endpoints: HashMap::new(),
+                        models: vec!["gpt-4.1".into()],
+                    },
+                ),
+            ]),
             models: ModelsConfig {
                 served: vec!["claude-sonnet-4-6".into()],
                 fallback_models: HashMap::new(),
@@ -893,9 +1069,9 @@ mod tests {
                 preferred_models: HashMap::from([(
                     "claude-sonnet-4-6".into(),
                     vec![RouteTargetConfig {
-                        provider: AccountProvider::OpenAi,
+                        provider: "tabcode".into(),
                         model: "gpt-4.1".into(),
-                        endpoint: Some("priority".into()),
+                        endpoint: None,
                         reasoning: Some(RouteReasoningConfig {
                             effort: Some("medium".into()),
                             budget: None,
@@ -907,11 +1083,11 @@ mod tests {
                 health: RoutingHealthConfig::default(),
             },
             accounts: vec![AccountConfig {
-                id: "openai-a".into(),
-                provider: AccountProvider::OpenAi,
+                id: "tabcode-a".into(),
+                provider: "tabcode".into(),
                 enabled: true,
                 weight: 1,
-                models: Some(vec!["gpt-4.1".into(), "gpt-4.1-mini".into()]),
+                models: Some(vec!["gpt-4.1".into()]),
                 auth: AccountAuth::ApiKey {
                     api_key: "sk-test".into(),
                 },
@@ -924,8 +1100,8 @@ mod tests {
             compaction: CompactionConfig {
                 temperature: 0.1,
                 preferred_targets: vec![RouteTargetConfig {
-                    provider: AccountProvider::OpenAi,
-                    model: "gpt-4.1-mini".into(),
+                    provider: "tabcode".into(),
+                    model: "gpt-4.1".into(),
                     endpoint: None,
                     reasoning: Some(RouteReasoningConfig {
                         effort: Some("none".into()),
@@ -948,7 +1124,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.accounts[0].models = Some(vec!["unknown-model".into()]);
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("not present in provider openai catalog"));
+        assert!(err.contains("not present in provider 'tabcode' catalog"));
     }
 
     #[test]
@@ -962,5 +1138,11 @@ mod tests {
         assert_eq!(reasoning.budget, 16384);
         assert_eq!(reasoning.level, "MEDIUM");
         assert_eq!(reasoning.preset.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn resolves_provider_type_from_dynamic_provider_name() {
+        let cfg = base_config();
+        assert_eq!(cfg.provider_type("tabcode").unwrap(), ProviderType::OpenAi);
     }
 }

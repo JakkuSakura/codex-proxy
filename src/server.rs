@@ -83,7 +83,7 @@ async fn run_recovery_probe_pass() {
             continue;
         };
 
-        let provider = providers::get_provider(account.provider);
+        let provider = providers::get_provider(&account.provider);
         let route = crate::account_pool::ResolvedRoute {
             requested_model: "__recovery_probe__".into(),
             logical_model: "__recovery_probe__".into(),
@@ -93,12 +93,12 @@ async fn run_recovery_probe_pass() {
                 .and_then(|models| models.first().cloned())
                 .or_else(|| {
                     CONFIG
-                        .provider_catalog(account.provider)
+                        .provider_catalog(&account.provider)
                         .and_then(|models| models.first().cloned())
                 })
                 .unwrap_or_else(|| "__probe__".into()),
             endpoint: None,
-            provider: account.provider,
+            provider: account.provider.clone(),
             account_index: index,
             account_id: account.id.clone(),
             cache_hit: false,
@@ -155,7 +155,7 @@ async fn responses_handler(
 
     let normalized = normalizer::normalize(data.clone());
     let route = resolve_response_route(&data.model, &normalized.messages)?;
-    let provider = providers::get_provider(route.provider);
+    let provider = providers::get_provider(&route.provider);
     let (account, _) = ACCOUNT_POOL
         .get_account(route.account_index)
         .ok_or_else(|| ProxyError::Internal("Resolved account missing from pool".into()))?;
@@ -192,7 +192,7 @@ async fn compact_handler(
         include: None,
     });
     let route = resolve_compaction_route(&normalized.messages)?;
-    let provider = providers::get_provider(route.provider);
+    let provider = providers::get_provider(&route.provider);
     let (account, _) = ACCOUNT_POOL
         .get_account(route.account_index)
         .ok_or_else(|| ProxyError::Internal("Resolved account missing from pool".into()))?;

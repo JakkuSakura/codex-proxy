@@ -31,10 +31,7 @@ impl OpenAiProvider {
         context: &ProviderExecutionContext,
     ) -> Result<String, ProxyError> {
         CONFIG
-            .endpoint_url(
-                crate::account_pool::AccountProvider::OpenAi,
-                context.endpoint_name(),
-            )
+            .endpoint_url(context.provider(), context.endpoint_name())
             .map_err(ProxyError::Config)
     }
 
@@ -240,7 +237,7 @@ fn budget_to_effort(budget: u64) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account_pool::{Account, AccountAuth, AccountProvider, ResolvedRoute};
+    use crate::account_pool::{Account, AccountAuth, ResolvedRoute};
 
     fn context(
         reasoning: Option<EffectiveReasoningConfig>,
@@ -252,7 +249,7 @@ mod tests {
                 logical_model: "claude-sonnet-4-6".into(),
                 upstream_model: "gpt-5".into(),
                 endpoint: endpoint.map(str::to_string),
-                provider: AccountProvider::OpenAi,
+                provider: "openai".into(),
                 account_index: 0,
                 account_id: "openai-a".into(),
                 cache_hit: false,
@@ -262,7 +259,7 @@ mod tests {
             },
             account: Account {
                 id: "openai-a".into(),
-                provider: AccountProvider::OpenAi,
+                provider: "openai".into(),
                 auth: AccountAuth::ApiKey {
                     api_key: "test-key".into(),
                 },
