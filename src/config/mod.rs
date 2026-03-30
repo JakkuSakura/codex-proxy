@@ -2,6 +2,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -807,7 +808,107 @@ fn default_provider_prefixes() -> HashMap<String, AccountProvider> {
 }
 
 fn dirs_home() -> PathBuf {
-    env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/root"))
+    resolve_home_dir(
+        env::var_os("HOME").map(PathBuf::from),
+        env::var_os("USERPROFILE").map(PathBuf::from),
+        env::var_os("HOMEDRIVE"),
+        env::var_os("HOMEPATH"),
+        cfg!(windows),
+    )
+}
+
+fn resolve_home_dir(
+    home: Option<PathBuf>,
+    userprofile: Option<PathBuf>,
+    homedrive: Option<OsString>,
+    homepath: Option<OsString>,
+    prefer_windows_env: bool,
+) -> PathBuf {
+    let home = home.filter(|p| !p.as_os_str().is_empty());
+    let userprofile = userprofile.filter(|p| !p.as_os_str().is_empty());
+    let windows_home = join_windows_home(homedrive, homepath);
+
+    if prefer_windows_env {
+        if let Some(path) = userprofile.as_ref() {
+            return path.clone();
+        }
+        if let Some(path) = windows_home.as_ref() {
+            return path.clone();
+        }
+    }
+
+    if let Some(path) = home {
+        return path;
+    }
+
+    if !prefer_windows_env {
+        if let Some(path) = userprofile {
+            return path;
+        }
+        if let Some(path) = windows_home {
+            return path;
+        }
+    }
+
+    PathBuf::from("/root")
+}
+
+fn join_windows_home(homedrive: Option<OsString>, homepath: Option<OsString>) -> Option<PathBuf> {
+    let mut homedrive = homedrive.filter(|value| !value.is_empty())?;
+    let homepath = homepath.filter(|value| !value.is_empty())?;
+    homedrive.push(homepath);
+    Some(PathBuf::from(homedrive))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_home_dir;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[test]
+    fn resolve_home_dir_prefers_userprofile_on_windows() {
+        let home = resolve_home_dir(
+            Some(PathBuf::from("/root")),
+            Some(PathBuf::from(r"C:\Users\woodrow")),
+            None,
+            None,
+            true,
+        );
+
+        assert_eq!(home, PathBuf::from(r"C:\Users\woodrow"));
+    }
+
+    #[test]
+    fn resolve_home_dir_falls_back_to_home_when_windows_vars_missing() {
+        let home = resolve_home_dir(Some(PathBuf::from("/custom/home")), None, None, None, true);
+
+        assert_eq!(home, PathBuf::from("/custom/home"));
+    }
+
+    #[test]
+    fn resolve_home_dir_combines_home_drive_and_path_on_windows() {
+        let home = resolve_home_dir(
+            None,
+            None,
+            Some(OsString::from("C:")),
+            Some(OsString::from(r"\Users\woodrow")),
+            true,
+        );
+
+        assert_eq!(home, PathBuf::from(r"C:\Users\woodrow"));
+    }
+
+    #[test]
+    fn resolve_home_dir_prefers_home_on_non_windows() {
+        let home = resolve_home_dir(
+            Some(PathBuf::from("/custom/home")),
+            Some(PathBuf::from(r"C:\Users\woodrow")),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(home, PathBuf::from("/custom/home"));
+    }
 }
