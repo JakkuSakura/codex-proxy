@@ -322,6 +322,8 @@ mod tests {
             account("zai", "zai", Some(vec!["glm-4.6"]), 1),
             account("openai", "openai", Some(vec!["gpt-4.1"]), 1),
         ]);
+        pool.mark_success(0);
+        pool.mark_success(1);
         let state = RoutingState::new();
         let route = Router::resolve_route(
             &pool,
@@ -341,6 +343,7 @@ mod tests {
     fn reuses_sticky_binding_when_still_healthy() {
         let pool = AccountPool::new();
         pool.load_accounts(vec![account("openai", "openai", Some(vec!["gpt-4.1"]), 1)]);
+        pool.mark_success(0);
         let state = RoutingState::new();
         let first = Router::resolve_route(
             &pool,

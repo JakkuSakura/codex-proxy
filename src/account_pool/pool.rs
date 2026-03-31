@@ -71,12 +71,12 @@ struct AccountState {
 impl AccountState {
     fn new() -> Self {
         Self {
-            alive: true,
+            alive: false,
             consecutive_failures: 0,
             cache_key_hits: AtomicU64::new(0),
             last_failure_at: None,
-            unhealthy_until: None,
-            recovery_probe_due: false,
+            unhealthy_until: Some(SystemTime::now()),
+            recovery_probe_due: true,
             probe_in_progress: AtomicBool::new(false),
         }
     }
@@ -421,6 +421,8 @@ mod tests {
             account("a", "openai", Some(vec!["gpt-4.1"]), 1),
             account("b", "openai", Some(vec!["gpt-4.1-mini"]), 1),
         ]);
+        pool.mark_success(0);
+        pool.mark_success(1);
 
         let compatible = pool.healthy_compatible_accounts_for_target(&target("openai", "gpt-4.1"));
         assert_eq!(compatible, vec![0]);
@@ -430,6 +432,7 @@ mod tests {
     fn marks_account_unhealthy_on_first_failure() {
         let pool = AccountPool::new();
         pool.load_accounts(vec![account("a", "openai", None, 1)]);
+        pool.mark_success(0);
         pool.mark_failure(0, false);
         let (_, snapshot) = pool.get_account(0).unwrap();
         assert!(!snapshot.alive);
