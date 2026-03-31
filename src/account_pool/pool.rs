@@ -232,6 +232,13 @@ impl AccountPool {
         })
     }
 
+    pub fn first_account_for_provider(&self, provider: &str) -> Option<(usize, Account)> {
+        let guard = self.accounts.read();
+        guard.iter().enumerate().find_map(|(index, (account, _))| {
+            (account.provider == provider).then_some((index, account.clone()))
+        })
+    }
+
     pub fn mark_success(&self, index: usize) {
         let guard = self.accounts.read();
         if let Some((account, state)) = guard.get(index) {

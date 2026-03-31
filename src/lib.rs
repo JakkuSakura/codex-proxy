@@ -3,6 +3,7 @@ pub mod account_pool;
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod model_catalog;
 pub mod normalizer;
 pub mod providers;
 pub mod schema;

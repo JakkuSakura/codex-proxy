@@ -167,6 +167,8 @@ pub struct ZaiProviderConfig {
 pub struct OpenAiProviderConfig {
     pub api_url: String,
     #[serde(default)]
+    pub models_url: Option<String>,
+    #[serde(default)]
     pub endpoints: HashMap<String, String>,
     #[serde(default)]
     pub models: Vec<String>,
@@ -194,6 +196,8 @@ pub enum ProviderConfig {
     },
     OpenAi {
         api_url: String,
+        #[serde(default)]
+        models_url: Option<String>,
         #[serde(default)]
         endpoints: HashMap<String, String>,
         #[serde(default)]
@@ -254,6 +258,23 @@ impl ProviderConfig {
         }
     }
 
+    pub fn as_openai(&self) -> Option<OpenAiProviderConfig> {
+        match self {
+            ProviderConfig::OpenAi {
+                api_url,
+                models_url,
+                endpoints,
+                models,
+            } => Some(OpenAiProviderConfig {
+                api_url: api_url.clone(),
+                models_url: models_url.clone(),
+                endpoints: endpoints.clone(),
+                models: models.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     pub fn endpoint_url(
         &self,
         provider_name: &str,
@@ -284,6 +305,23 @@ impl ProviderConfig {
         }
     }
 
+    pub fn models_url(&self, provider_name: &str) -> Option<String> {
+        match self {
+            ProviderConfig::OpenAi {
+                api_url,
+                models_url,
+                ..
+            } => models_url
+                .clone()
+                .or_else(|| infer_openai_models_url(api_url))
+                .or_else(|| Some(format!("{}/v1/models", api_url.trim_end_matches('/')))),
+            _ => {
+                let _ = provider_name;
+                None
+            }
+        }
+    }
+
     pub fn validate(&self, provider_name: &str) -> Result<(), ConfigError> {
         match self {
             ProviderConfig::Gemini {
@@ -302,9 +340,6 @@ impl ProviderConfig {
             }
             ProviderConfig::Zai {
                 api_url, endpoints, ..
-            }
-            | ProviderConfig::OpenAi {
-                api_url, endpoints, ..
             } => {
                 validate_url(api_url, &format!("Provider '{}' api_url", provider_name))?;
                 for (name, url) in endpoints {
@@ -314,9 +349,37 @@ impl ProviderConfig {
                     )?;
                 }
             }
+            ProviderConfig::OpenAi {
+                api_url,
+                endpoints,
+                models_url,
+                ..
+            } => {
+                validate_url(api_url, &format!("Provider '{}' api_url", provider_name))?;
+                for (name, url) in endpoints {
+                    validate_url(
+                        url,
+                        &format!("Provider '{}' endpoint '{}'", provider_name, name),
+                    )?;
+                }
+                if let Some(url) = models_url {
+                    validate_url(url, &format!("Provider '{}' models_url", provider_name))?;
+                }
+            }
         }
         Ok(())
     }
+}
+
+fn infer_openai_models_url(api_url: &str) -> Option<String> {
+    let trimmed = api_url.trim_end_matches('/');
+    if let Some(prefix) = trimmed.strip_suffix("/v1/responses") {
+        return Some(format!("{prefix}/v1/models"));
+    }
+    if let Some(prefix) = trimmed.strip_suffix("/responses") {
+        return Some(format!("{prefix}/models"));
+    }
+    None
 }
 
 pub type ProvidersConfig = HashMap<String, ProviderConfig>;
@@ -327,6 +390,64 @@ pub struct ModelsConfig {
     pub served: Vec<String>,
     #[serde(default)]
     pub fallback_models: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelDiscoveryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_model_discovery_interval_seconds")]
+    pub interval_seconds: u64,
+}
+
+fn default_model_discovery_interval_seconds() -> u64 {
+    300
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelPricingConfig {
+    #[serde(default)]
+    pub input_per_mtoken: Option<f64>,
+    #[serde(default)]
+    pub output_per_mtoken: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelMetadataConfig {
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub pricing: Option<ModelPricingConfig>,
+}
+
+pub type ProviderModelMetadataConfig = HashMap<String, HashMap<String, ModelMetadataConfig>>;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelsEndpointSource {
+    Served,
+    Discovered,
+    Both,
+}
+
+fn default_models_endpoint_source() -> ModelsEndpointSource {
+    ModelsEndpointSource::Served
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsEndpointConfig {
+    #[serde(default = "default_models_endpoint_source")]
+    pub source: ModelsEndpointSource,
+}
+
+impl Default for ModelsEndpointConfig {
+    fn default() -> Self {
+        Self {
+            source: default_models_endpoint_source(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -458,6 +579,9 @@ pub struct Config {
     pub server: ServerConfig,
     pub providers: ProvidersConfig,
     pub models: ModelsConfig,
+    pub model_discovery: ModelDiscoveryConfig,
+    pub model_metadata: ProviderModelMetadataConfig,
+    pub models_endpoint: ModelsEndpointConfig,
     pub routing: RoutingConfig,
     pub accounts: Vec<AccountConfig>,
     pub access: AccessControlConfig,
@@ -471,6 +595,12 @@ pub struct PersistedConfig {
     pub server: ServerConfig,
     pub providers: ProvidersConfig,
     pub models: ModelsConfig,
+    #[serde(default)]
+    pub model_discovery: ModelDiscoveryConfig,
+    #[serde(default)]
+    pub model_metadata: ProviderModelMetadataConfig,
+    #[serde(default)]
+    pub models_endpoint: ModelsEndpointConfig,
     pub routing: RoutingConfig,
     pub accounts: Vec<AccountConfig>,
     #[serde(default)]
@@ -487,6 +617,9 @@ impl PersistedConfig {
             server: self.server,
             providers: self.providers,
             models: self.models,
+            model_discovery: self.model_discovery,
+            model_metadata: self.model_metadata,
+            models_endpoint: self.models_endpoint,
             routing: self.routing,
             accounts: self.accounts,
             access: self.access,
@@ -505,6 +638,12 @@ struct FileConfig {
     pub providers: Option<ProvidersConfig>,
     #[serde(default)]
     pub models: Option<ModelsConfig>,
+    #[serde(default)]
+    pub model_discovery: Option<ModelDiscoveryConfig>,
+    #[serde(default)]
+    pub model_metadata: Option<ProviderModelMetadataConfig>,
+    #[serde(default)]
+    pub models_endpoint: Option<ModelsEndpointConfig>,
     #[serde(default)]
     pub routing: Option<RoutingConfig>,
     #[serde(default)]
@@ -664,6 +803,7 @@ impl Config {
             "openai".into(),
             ProviderConfig::OpenAi {
                 api_url: validate_url(&openai_api_url, "OpenAI API URL").unwrap(),
+                models_url: None,
                 endpoints: HashMap::new(),
                 models: Vec::new(),
             },
@@ -682,6 +822,9 @@ impl Config {
                 served: served_models,
                 fallback_models: HashMap::new(),
             },
+            model_discovery: ModelDiscoveryConfig::default(),
+            model_metadata: ProviderModelMetadataConfig::new(),
+            models_endpoint: ModelsEndpointConfig::default(),
             routing: RoutingConfig {
                 model_overrides: HashMap::new(),
                 preferred_models: HashMap::new(),
@@ -737,6 +880,15 @@ impl Config {
             if let Some(models) = file_cfg.models {
                 self.models = models;
             }
+            if let Some(model_discovery) = file_cfg.model_discovery {
+                self.model_discovery = model_discovery;
+            }
+            if let Some(model_metadata) = file_cfg.model_metadata {
+                self.model_metadata = model_metadata;
+            }
+            if let Some(models_endpoint) = file_cfg.models_endpoint {
+                self.models_endpoint = models_endpoint;
+            }
             if let Some(routing) = file_cfg.routing {
                 self.routing = routing;
             }
@@ -768,6 +920,9 @@ impl Config {
             server: self.server.clone(),
             providers: self.providers.clone(),
             models: self.models.clone(),
+            model_discovery: self.model_discovery.clone(),
+            model_metadata: self.model_metadata.clone(),
+            models_endpoint: self.models_endpoint.clone(),
             routing: self.routing.clone(),
             accounts: self.accounts.clone(),
             access: self.access.clone(),
@@ -805,6 +960,52 @@ impl Config {
                 ));
             }
             provider.validate(provider_name)?;
+        }
+
+        for (provider, models) in &self.model_metadata {
+            self.provider_type(provider)?;
+            for (model, metadata) in models {
+                if model.trim().is_empty() {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "model_metadata['{}'] contains an empty model id",
+                        provider
+                    )));
+                }
+                if let Some(value) = metadata.context_window
+                    && value == 0
+                {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "model_metadata['{}']['{}'].context_window must be > 0",
+                        provider, model
+                    )));
+                }
+                if let Some(value) = metadata.max_output_tokens
+                    && value == 0
+                {
+                    return Err(ConfigError::InvalidValue(format!(
+                        "model_metadata['{}']['{}'].max_output_tokens must be > 0",
+                        provider, model
+                    )));
+                }
+                if let Some(pricing) = &metadata.pricing {
+                    if let Some(v) = pricing.input_per_mtoken
+                        && v < 0.0
+                    {
+                        return Err(ConfigError::InvalidValue(format!(
+                            "model_metadata['{}']['{}'].pricing.input_per_mtoken must be >= 0",
+                            provider, model
+                        )));
+                    }
+                    if let Some(v) = pricing.output_per_mtoken
+                        && v < 0.0
+                    {
+                        return Err(ConfigError::InvalidValue(format!(
+                            "model_metadata['{}']['{}'].pricing.output_per_mtoken must be >= 0",
+                            provider, model
+                        )));
+                    }
+                }
+            }
         }
 
         if self.server.port == 0 {
@@ -1075,6 +1276,14 @@ impl Config {
         (!models.is_empty()).then_some(models)
     }
 
+    pub fn provider_models_url(&self, provider: &str) -> Option<String> {
+        self.providers.get(provider)?.models_url(provider)
+    }
+
+    pub fn model_metadata(&self, provider: &str, model: &str) -> Option<&ModelMetadataConfig> {
+        self.model_metadata.get(provider)?.get(model)
+    }
+
     pub fn endpoint_url(
         &self,
         provider: &str,
@@ -1228,6 +1437,7 @@ mod tests {
                     "openai".into(),
                     ProviderConfig::OpenAi {
                         api_url: "https://api.openai.com/v1/responses".into(),
+                        models_url: None,
                         endpoints: HashMap::from([(
                             "priority".into(),
                             "https://priority.openai.com/v1/responses".into(),
@@ -1239,6 +1449,7 @@ mod tests {
                     "tabcode".into(),
                     ProviderConfig::OpenAi {
                         api_url: "https://tabcode.example/v1/responses".into(),
+                        models_url: None,
                         endpoints: HashMap::new(),
                         models: vec!["gpt-4.1".into()],
                     },
@@ -1248,6 +1459,9 @@ mod tests {
                 served: vec!["claude-sonnet-4-6".into()],
                 fallback_models: HashMap::new(),
             },
+            model_discovery: ModelDiscoveryConfig::default(),
+            model_metadata: ProviderModelMetadataConfig::new(),
+            models_endpoint: ModelsEndpointConfig::default(),
             routing: RoutingConfig {
                 model_overrides: HashMap::new(),
                 preferred_models: HashMap::from([(

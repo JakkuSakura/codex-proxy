@@ -38,6 +38,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/favicon.ico", get(favicon_handler))
         .route("/", get(ui_handler))
         .route("/ui", get(ui_handler))
+        .route("/v1/models", get(models_handler))
+        .route("/models", get(models_handler))
         .route("/api/config", get(api_config_get).post(api_config_put))
         .route("/api/accounts", get(api_accounts_get))
         .route(
@@ -47,6 +49,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/access-keys/{id}", delete(api_access_keys_delete))
         .route("/api/usage/keys", get(api_usage_keys_get))
         .route("/api/usage/accounts", get(api_usage_accounts_get))
+        .route("/api/models", get(api_models_get))
         .route("/v1/responses", post(responses_handler))
         .route("/responses", post(responses_handler))
         .route("/v1/responses/compact", post(compact_handler))
@@ -65,6 +68,7 @@ fn initialize_runtime_state(state: &AppState) {
     state.accounts().configure_health(health);
     state.accounts().load_accounts(accounts);
     start_recovery_probe_loop(state);
+    start_model_discovery_loop(state);
 }
 
 fn start_recovery_probe_loop(state: &AppState) {
@@ -136,6 +140,95 @@ async fn run_recovery_probe_pass(state: &AppState) {
     }
 }
 
+fn start_model_discovery_loop(state: &AppState) {
+    if !with_config(state.config(), |cfg| cfg.model_discovery.enabled) {
+        return;
+    }
+    if state
+        .model_discovery_started_flag()
+        .swap(true, Ordering::AcqRel)
+    {
+        return;
+    }
+
+    let interval_seconds = with_config(state.config(), |cfg| cfg.model_discovery.interval_seconds);
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_seconds.max(5)));
+        loop {
+            interval.tick().await;
+            run_model_discovery_pass(&state).await;
+        }
+    });
+}
+
+async fn run_model_discovery_pass(state: &AppState) {
+    let provider_names = with_config(state.config(), |cfg| {
+        let mut names: Vec<String> = cfg.providers.keys().cloned().collect();
+        names.sort();
+        names
+    });
+
+    for provider in provider_names {
+        discover_models_for_provider(state, &provider).await;
+    }
+}
+
+async fn discover_models_for_provider(state: &AppState, provider: &str) {
+    let Some((account_index, account)) = state.accounts().first_account_for_provider(provider)
+    else {
+        state
+            .model_catalog()
+            .update_error(provider, "No configured account for provider".into());
+        return;
+    };
+
+    let route = crate::account_pool::ResolvedRoute {
+        requested_model: "__models__".into(),
+        logical_model: "__models__".into(),
+        upstream_model: "__models__".into(),
+        endpoint: None,
+        provider: provider.to_string(),
+        account_index,
+        account_id: account.id.clone(),
+        cache_hit: false,
+        cache_key: 0,
+        preferred_target_index: usize::MAX,
+        reasoning: None,
+    };
+
+    let context = ProviderExecutionContext {
+        route,
+        account,
+        config: state.config().clone(),
+        gemini_auth: state.gemini_auth(),
+    };
+
+    let provider_impl = crate::providers::get_provider(state, provider);
+    match provider_impl.list_models(context).await {
+        Ok(models) => state.model_catalog().update_success(provider, models),
+        Err(ProxyError::NotImplemented(_)) => {
+            let models = with_config(state.config(), |cfg| {
+                cfg.provider_catalog(provider)
+                    .cloned()
+                    .unwrap_or_else(Vec::new)
+            });
+            if models.is_empty() {
+                state.model_catalog().update_error(
+                    provider,
+                    "Provider does not support model discovery and no provider.models are configured"
+                        .into(),
+                );
+            } else {
+                state.model_catalog().update_success(provider, models);
+            }
+        }
+        Err(err) => state
+            .model_catalog()
+            .update_error(provider, err.to_string()),
+    }
+}
+
 async fn ui_handler() -> Response<Body> {
     ui::get_html()
 }
@@ -146,6 +239,117 @@ async fn health_handler() -> &'static str {
 
 async fn favicon_handler() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+async fn models_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ProxyError> {
+    let _ = crate::access::authenticate_request(state.config(), &headers)?;
+    let (served, targets, metadata, source) = with_config(state.config(), |cfg| {
+        (
+            cfg.models.served.clone(),
+            cfg.routing.preferred_models.clone(),
+            cfg.model_metadata.clone(),
+            cfg.models_endpoint.source,
+        )
+    });
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[derive(Default)]
+    struct DiscoveredModel {
+        providers: BTreeSet<String>,
+    }
+
+    let mut out: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+
+    if source == crate::config::ModelsEndpointSource::Discovered
+        || source == crate::config::ModelsEndpointSource::Both
+    {
+        let mut discovered: BTreeMap<String, DiscoveredModel> = BTreeMap::new();
+        for snapshot in state.model_catalog().snapshot() {
+            for model_id in snapshot.models {
+                discovered
+                    .entry(model_id)
+                    .or_default()
+                    .providers
+                    .insert(snapshot.provider.clone());
+            }
+        }
+
+        for (model_id, item) in discovered {
+            let providers: Vec<String> = item.providers.into_iter().collect();
+            let mut provider_metadata = Vec::new();
+            for provider in &providers {
+                let meta = metadata
+                    .get(provider)
+                    .and_then(|models| models.get(&model_id));
+                provider_metadata.push(json!({
+                    "provider": provider,
+                    "metadata": meta,
+                }));
+            }
+
+            out.insert(
+                model_id.clone(),
+                json!({
+                    "id": model_id,
+                    "object": "model",
+                    "owned_by": "codex-proxy",
+                    "metadata": {
+                        "providers": providers,
+                        "provider_metadata": provider_metadata,
+                        "served": false,
+                    }
+                }),
+            );
+        }
+    }
+
+    if source == crate::config::ModelsEndpointSource::Served
+        || source == crate::config::ModelsEndpointSource::Both
+    {
+        for logical_model in served {
+            let routing_targets = targets.get(&logical_model).cloned().unwrap_or_default();
+            let default_target = routing_targets.first().cloned();
+            let default_target_metadata = default_target.as_ref().and_then(|target| {
+                metadata
+                    .get(&target.provider)
+                    .and_then(|models| models.get(&target.model))
+            });
+
+            out.insert(
+                logical_model.clone(),
+                json!({
+                    "id": logical_model,
+                    "object": "model",
+                    "owned_by": "codex-proxy",
+                    "metadata": {
+                        "routing_targets": routing_targets,
+                        "default_target": default_target,
+                        "default_target_metadata": default_target_metadata,
+                        "served": true,
+                    }
+                }),
+            );
+        }
+    }
+
+    Ok(Json(json!({
+        "object": "list",
+        "data": out.into_values().collect::<Vec<_>>(),
+    })))
+}
+
+async fn api_models_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ProxyError> {
+    authenticate_admin(&state, &headers)?;
+    Ok(Json(json!({
+        "providers": state.model_catalog().snapshot(),
+    })))
 }
 
 async fn responses_handler(

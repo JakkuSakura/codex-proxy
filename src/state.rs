@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use crate::account_pool::{AccountPool, RoutingState};
 use crate::auth::GeminiAuthManager;
 use crate::config::ConfigHandle;
+use crate::model_catalog::ModelCatalog;
 use crate::providers::ProviderRegistry;
 use crate::usage::UsageStore;
 
@@ -20,6 +21,8 @@ struct AppStateInner {
     pub providers: ProviderRegistry,
     pub gemini_auth: Arc<GeminiAuthManager>,
     pub recovery_probes_started: AtomicBool,
+    pub model_discovery_started: AtomicBool,
+    pub model_catalog: ModelCatalog,
 }
 
 impl AppState {
@@ -33,6 +36,8 @@ impl AppState {
                 providers: ProviderRegistry::new(),
                 gemini_auth: Arc::new(GeminiAuthManager::new(config.clone())),
                 recovery_probes_started: AtomicBool::new(false),
+                model_discovery_started: AtomicBool::new(false),
+                model_catalog: ModelCatalog::new(),
             }),
         }
     }
@@ -63,5 +68,13 @@ impl AppState {
 
     pub fn recovery_started_flag(&self) -> &AtomicBool {
         &self.inner.recovery_probes_started
+    }
+
+    pub fn model_discovery_started_flag(&self) -> &AtomicBool {
+        &self.inner.model_discovery_started
+    }
+
+    pub fn model_catalog(&self) -> &ModelCatalog {
+        &self.inner.model_catalog
     }
 }

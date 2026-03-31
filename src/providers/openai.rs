@@ -51,6 +51,54 @@ impl OpenAiProvider {
         Ok(url)
     }
 
+    fn resolve_models_url(&self, context: &ProviderExecutionContext) -> Result<String, ProxyError> {
+        with_config(&context.config, |cfg| {
+            cfg.provider_models_url(context.provider())
+        })
+        .ok_or_else(|| {
+            ProxyError::Provider(format!(
+                "Provider '{}' does not have a models_url configured",
+                context.provider()
+            ))
+        })
+    }
+
+    async fn get_json_from(
+        &self,
+        endpoint_url: &str,
+        mut headers: HeaderMap,
+        context: &ProviderExecutionContext,
+    ) -> Result<reqwest::Response, ProxyError> {
+        let api_key = match &context.account.auth {
+            AccountAuth::ApiKey { api_key } => api_key,
+            _ => {
+                return Err(ProxyError::Auth(
+                    "OpenAI provider requires account auth.type=api_key".into(),
+                ));
+            }
+        };
+
+        headers.remove(axum::http::header::HOST);
+        headers.remove(axum::http::header::CONTENT_LENGTH);
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {api_key}").parse().map_err(|e| {
+                ProxyError::Internal(format!("Invalid OpenAI authorization header: {e}"))
+            })?,
+        );
+
+        self.client
+            .get(endpoint_url)
+            .headers(headers)
+            .timeout(std::time::Duration::from_secs(with_config(
+                &context.config,
+                |cfg| cfg.timeouts.read_seconds,
+            )))
+            .send()
+            .await
+            .map_err(ProxyError::Http)
+    }
+
     async fn send_json_to(
         &self,
         endpoint_url: &str,
@@ -223,6 +271,44 @@ impl Provider for OpenAiProvider {
         })
     }
 
+    fn list_models(
+        &self,
+        context: ProviderExecutionContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<String>, ProxyError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let models_url = self.resolve_models_url(&context)?;
+            let resp = self
+                .get_json_from(&models_url, HeaderMap::new(), &context)
+                .await?;
+
+            let status = resp.status();
+            let body = resp.text().await.map_err(ProxyError::Http)?;
+            if !status.is_success() {
+                return Err(ProxyError::Provider(format!(
+                    "Upstream models endpoint returned status {} body={}",
+                    status, body
+                )));
+            }
+
+            let parsed: Value =
+                serde_json::from_str(&body).map_err(|e| ProxyError::Provider(e.to_string()))?;
+            let data = parsed
+                .get("data")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| ProxyError::Provider("Upstream /models missing data[]".into()))?;
+
+            let mut out = Vec::new();
+            for item in data {
+                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                    out.push(id.to_string());
+                }
+            }
+            Ok(out)
+        })
+    }
+
     fn probe_account(
         &self,
         context: ProviderExecutionContext,
@@ -331,6 +417,7 @@ mod tests {
             "openai".into(),
             ProviderConfig::OpenAi {
                 api_url: "https://example.com/v1/responses".into(),
+                models_url: None,
                 endpoints: HashMap::new(),
                 models: Vec::new(),
             },
@@ -348,6 +435,9 @@ mod tests {
                 served: Vec::new(),
                 fallback_models: HashMap::new(),
             },
+            model_discovery: crate::config::ModelDiscoveryConfig::default(),
+            model_metadata: crate::config::ProviderModelMetadataConfig::new(),
+            models_endpoint: crate::config::ModelsEndpointConfig::default(),
             routing: RoutingConfig {
                 model_overrides: HashMap::new(),
                 preferred_models: HashMap::new(),

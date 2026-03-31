@@ -65,6 +65,20 @@ pub trait Provider: Send + Sync {
         })
     }
 
+    fn list_models(
+        &self,
+        context: ProviderExecutionContext,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<String>, ProxyError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let _ = context;
+            Err(ProxyError::NotImplemented(
+                "Model discovery not implemented for this provider".into(),
+            ))
+        })
+    }
+
     fn probe_account(
         &self,
         context: ProviderExecutionContext,
