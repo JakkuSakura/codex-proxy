@@ -193,6 +193,7 @@ pub enum ProviderConfig {
         #[serde(default)]
         models: Vec<String>,
     },
+    #[serde(alias = "openai")]
     OpenAi {
         api_url: String,
         #[serde(default)]
@@ -561,7 +562,7 @@ pub struct TimeoutsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionConfig {
     pub temperature: f64,
-    pub preferred_targets: Vec<RouteTargetConfig>,
+    pub preferred_targets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1256,14 +1257,16 @@ impl Config {
             }
         }
 
-        if !self.compaction.preferred_targets.is_empty() {
-            for target in &self.compaction.preferred_targets {
-                self.validate_route_target(target, "compaction.preferred_targets")?;
-            }
-            if !self.has_compatible_enabled_account(&self.compaction.preferred_targets) {
-                return Err(ConfigError::InvalidValue(
-                    "compaction.preferred_targets has no compatible enabled account".into(),
-                ));
+        for logical_model in &self.compaction.preferred_targets {
+            if !self
+                .routing
+                .model_provider_priority
+                .contains_key(logical_model.as_str())
+            {
+                return Err(ConfigError::InvalidValue(format!(
+                    "compaction.preferred_targets references logical model '{}' which is not defined in routing.model_provider_priority",
+                    logical_model
+                )));
             }
         }
 
@@ -1319,8 +1322,18 @@ impl Config {
             .map(Vec::as_slice)
     }
 
-    pub fn compaction_targets(&self) -> &[RouteTargetConfig] {
-        &self.compaction.preferred_targets
+    pub fn compaction_targets(&self) -> Vec<RouteTargetConfig> {
+        self.compaction
+            .preferred_targets
+            .iter()
+            .filter_map(|logical_model| {
+                self.routing
+                    .model_provider_priority
+                    .get(logical_model)
+                    .cloned()
+            })
+            .flatten()
+            .collect()
     }
 
     pub fn recovery_probe_target(&self, provider: &str) -> Option<RouteTargetConfig> {
@@ -1670,16 +1683,7 @@ mod tests {
             },
             compaction: CompactionConfig {
                 temperature: 0.1,
-                preferred_targets: vec![RouteTargetConfig {
-                    provider: "tabcode".into(),
-                    model: "gpt-4.1".into(),
-                    endpoint: None,
-                    reasoning: Some(RouteReasoningConfig {
-                        effort: Some("none".into()),
-                        budget: None,
-                        level: None,
-                    }),
-                }],
+                preferred_targets: vec!["claude-sonnet-4-6".into()],
             },
         }
     }

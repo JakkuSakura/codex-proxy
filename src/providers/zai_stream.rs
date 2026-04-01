@@ -368,7 +368,6 @@ fn encode_event<T: Serialize>(seq_num: &mut u64, evt_type: &'static str, data: T
     Bytes::from(payload)
 }
 
-
 /// Deserialize a Vec field, treating null as empty vec.
 fn deserialize_null_default_vec<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
@@ -382,8 +381,12 @@ where
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("Vec or null")
         }
-        fn visit_none<E: de::Error>(self) -> Result<Vec<T>, E> { Ok(Vec::new()) }
-        fn visit_unit<E: de::Error>(self) -> Result<Vec<T>, E> { Ok(Vec::new()) }
+        fn visit_none<E: de::Error>(self) -> Result<Vec<T>, E> {
+            Ok(Vec::new())
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Vec<T>, E> {
+            Ok(Vec::new())
+        }
         fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Vec<T>, A::Error> {
             serde::Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))
         }
