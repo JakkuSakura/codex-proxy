@@ -50,7 +50,6 @@ pub struct UiRoutingConfig {
     pub model_overrides: std::collections::HashMap<String, String>,
     pub model_provider_priority:
         std::collections::HashMap<String, Vec<crate::config::RouteTargetConfig>>,
-    pub sticky_routing: crate::config::StickyRoutingConfig,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -81,7 +80,6 @@ pub fn get_current_config(state: &AppState) -> UiConfig {
         routing: UiRoutingConfig {
             model_overrides: cfg.routing.model_overrides.clone(),
             model_provider_priority: cfg.routing.model_provider_priority.clone(),
-            sticky_routing: cfg.routing.sticky_routing.clone(),
         },
         health: cfg.health.clone(),
         accounts: state.accounts().all_accounts_snapshot(),

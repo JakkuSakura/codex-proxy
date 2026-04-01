@@ -66,7 +66,6 @@ Top-level sections:
 - `routing`
 - `health`
 - `accounts`
-- `auto_compaction`
 - `reasoning`
 - `timeouts`
 - `compaction`
@@ -130,9 +129,6 @@ Top-level sections:
           "reasoning": { "effort": "none" }
         }
       ]
-    },
-    "sticky_routing": {
-      "enabled": true
     }
   },
   "health": {
@@ -166,9 +162,7 @@ Top-level sections:
   "auto_compaction": {
     "enabled": true,
     "max_attempts_per_request": 1,
-    "tail_items_to_keep": 8,
-    "compact_instructions": "Compact the conversation history for continued use. Preserve all tool and file context needed to continue the session.",
-    "summary_instructions": "Summarize the conversation history so far for continued use. Preserve key decisions, constraints, open tasks, file paths, and relevant technical details. Be concise but complete."
+    "tail_items_to_keep": 8
   },
   "reasoning": {
     "default_effort": "medium",
@@ -205,7 +199,7 @@ Top-level sections:
 - `routing.model_provider_priority[logical_model]` is the canonical ordered list of route targets.
 - Each route target picks one upstream provider and one upstream model.
 - `routing.model_overrides` maps requested models onto logical routing entries. Exact matches win first, then a literal `"*"` wildcard applies, and the resolved logical model is looked up in `routing.model_provider_priority`.
-- Sticky routing reuses the exact chosen `(provider, model, account)` path when it is still healthy.
+- Sticky routing is always enabled and reuses the exact chosen `(provider, model, account)` path when it is still healthy.
 - If the sticky-bound path is unhealthy, routing falls through to the next compatible preferred target.
 - `accounts[].models`, when omitted, means the account can use any model from that provider's catalog.
 - `accounts[].weight` is used as a stable tiebreaker between otherwise equivalent compatible accounts.
@@ -228,6 +222,7 @@ Top-level sections:
 - Z.AI and OpenAI currently use straightforward account-scoped API-key auth.
 - `routing.model_overrides` maps user-facing requested models to logical routing entries. Exact matches win first, then a literal `"*"` wildcard applies, otherwise the requested model is used unchanged.
 - Compaction uses the same ordered route planning path as normal responses, but with `compaction.preferred_targets`.
+- Auto-compaction prompt text is embedded in the binary; config only controls whether it runs and how aggressively it trims.
 - The OpenAI provider intentionally forwards requests upstream with minimal transformation: it swaps in the resolved upstream model and configured account auth, then forwards the OpenAI-shaped payload.
 
 ## UI
@@ -239,7 +234,6 @@ Open `http://127.0.0.1:8765/config` to inspect:
 - compaction targets
 - masked account auth data
 - account health and recovery-probe state
-- sticky routing stats
 - reasoning presets
 
 ## Development

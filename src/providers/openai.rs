@@ -401,8 +401,7 @@ mod tests {
     use crate::account_pool::{Account, AccountAuth, ResolvedRoute};
     use crate::config::{
         AccessControlConfig, CompactionConfig, ModelsConfig, ProviderConfig, ProvidersConfig,
-        ReasoningConfig, RoutingConfig, RoutingHealthConfig, ServerConfig, StickyRoutingConfig,
-        TimeoutsConfig,
+        ReasoningConfig, RoutingConfig, RoutingHealthConfig, ServerConfig, TimeoutsConfig,
     };
     use parking_lot::RwLock;
     use std::collections::HashMap;
@@ -443,7 +442,6 @@ mod tests {
             routing: RoutingConfig {
                 model_overrides: HashMap::new(),
                 model_provider_priority: HashMap::new(),
-                sticky_routing: StickyRoutingConfig::default(),
             },
             health: RoutingHealthConfig::default(),
             accounts: Vec::new(),

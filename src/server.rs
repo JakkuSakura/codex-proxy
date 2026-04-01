@@ -732,7 +732,7 @@ async fn auto_compact_request(
             let encrypted = run_native_compaction(
                 state,
                 prefix_items,
-                cfg.compact_instructions.clone(),
+                crate::config::AUTO_COMPACTION_COMPACT_INSTRUCTIONS.to_string(),
                 cache_key_override,
                 normalized_messages,
             )
@@ -768,7 +768,7 @@ async fn auto_compact_request(
             let summary = run_summary_compaction(
                 state,
                 prefix_items,
-                cfg.summary_instructions.clone(),
+                crate::config::AUTO_COMPACTION_SUMMARY_INSTRUCTIONS.to_string(),
                 cache_key_override,
                 normalized_messages,
             )
@@ -1128,9 +1128,7 @@ fn record_and_apply_result(
         Ok(response) => {
             let response = wrap_response_for_usage(state.clone(), usage_handle, response);
             state.accounts().mark_success(context.route.account_index);
-            if with_config(state.config(), |cfg| cfg.routing.sticky_routing.enabled) {
-                state.routing().bind_on_success(&context.route);
-            }
+            state.routing().bind_on_success(&context.route);
             Ok(response)
         }
         Err(error) => {

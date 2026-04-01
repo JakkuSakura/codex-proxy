@@ -444,10 +444,6 @@ pub struct AutoCompactionConfig {
     pub max_attempts_per_request: u32,
     #[serde(default = "default_auto_compaction_tail_items")]
     pub tail_items_to_keep: usize,
-    #[serde(default = "default_auto_compaction_compact_instructions")]
-    pub compact_instructions: String,
-    #[serde(default = "default_auto_compaction_summary_instructions")]
-    pub summary_instructions: String,
 }
 
 fn default_auto_compaction_max_attempts() -> u32 {
@@ -458,15 +454,9 @@ fn default_auto_compaction_tail_items() -> usize {
     8
 }
 
-fn default_auto_compaction_compact_instructions() -> String {
-    "Compact the conversation history for continued use. Preserve all tool and file context needed to continue the session."
-        .into()
-}
+pub const AUTO_COMPACTION_COMPACT_INSTRUCTIONS: &str = "Compact the conversation history for continued use. Preserve all tool and file context needed to continue the session.";
 
-fn default_auto_compaction_summary_instructions() -> String {
-    "Summarize the conversation history so far for continued use. Preserve key decisions, constraints, open tasks, file paths, and relevant technical details. Be concise but complete."
-        .into()
-}
+pub const AUTO_COMPACTION_SUMMARY_INSTRUCTIONS: &str = "Summarize the conversation history so far for continued use. Preserve key decisions, constraints, open tasks, file paths, and relevant technical details. Be concise but complete.";
 
 impl Default for AutoCompactionConfig {
     fn default() -> Self {
@@ -474,8 +464,6 @@ impl Default for AutoCompactionConfig {
             enabled: false,
             max_attempts_per_request: default_auto_compaction_max_attempts(),
             tail_items_to_keep: default_auto_compaction_tail_items(),
-            compact_instructions: default_auto_compaction_compact_instructions(),
-            summary_instructions: default_auto_compaction_summary_instructions(),
         }
     }
 }
@@ -536,12 +524,6 @@ pub struct RouteTargetConfig {
     pub reasoning: Option<RouteReasoningConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub struct StickyRoutingConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoutingHealthConfig {
     #[serde(default = "default_auth_failure_immediate_unhealthy")]
@@ -559,8 +541,6 @@ pub struct RoutingConfig {
     pub model_overrides: HashMap<String, String>,
     #[serde(default, alias = "preferred_models")]
     pub model_provider_priority: HashMap<String, Vec<RouteTargetConfig>>,
-    #[serde(default)]
-    pub sticky_routing: StickyRoutingConfig,
 }
 
 impl Default for RoutingHealthConfig {
@@ -952,7 +932,6 @@ impl Config {
             routing: RoutingConfig {
                 model_overrides: HashMap::new(),
                 model_provider_priority: HashMap::new(),
-                sticky_routing: StickyRoutingConfig::default(),
             },
             health: RoutingHealthConfig::default(),
             accounts,
@@ -1617,7 +1596,6 @@ mod tests {
                         }),
                     }],
                 )]),
-                sticky_routing: StickyRoutingConfig { enabled: true },
             },
             health: RoutingHealthConfig::default(),
             accounts: vec![AccountConfig {
@@ -1756,7 +1734,6 @@ mod tests {
                         { "provider": "tabcode", "model": "gpt-4.1" }
                     ]
                 },
-                "sticky_routing": { "enabled": true }
             },
             "health": {
                 "auth_failure_immediate_unhealthy": false,
@@ -1826,7 +1803,6 @@ mod tests {
                         { "provider": "tabcode", "model": "gpt-4.1" }
                     ]
                 },
-                "sticky_routing": { "enabled": true },
                 "health": {
                     "auth_failure_immediate_unhealthy": true,
                     "failure_threshold": 3,
@@ -1861,6 +1837,68 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("unknown field `health`"));
+    }
+
+    #[test]
+    fn rejects_legacy_sticky_routing_config() {
+        let err = serde_json::from_value::<PersistedConfig>(serde_json::json!({
+            "server": {
+                "host": "127.0.0.1",
+                "port": 8765,
+                "log_level": "INFO",
+                "debug_mode": false
+            },
+            "providers": {
+                "tabcode": {
+                    "type": "open_ai",
+                    "api_url": "https://tabcode.example/v1/responses",
+                    "endpoints": {},
+                    "models": ["gpt-4.1"]
+                }
+            },
+            "models": {
+                "served": ["claude-sonnet-4-6"],
+                "fallback_models": {}
+            },
+            "routing": {
+                "model_overrides": {},
+                "model_provider_priority": {
+                    "claude-sonnet-4-6": [
+                        { "provider": "tabcode", "model": "gpt-4.1" }
+                    ]
+                },
+                "sticky_routing": {
+                    "enabled": true
+                }
+            },
+            "health": {
+                "auth_failure_immediate_unhealthy": true,
+                "failure_threshold": 3,
+                "cooldown_seconds": 30
+            },
+            "accounts": [],
+            "access": {
+                "require_key": false,
+                "keys": []
+            },
+            "reasoning": {
+                "effort_levels": {
+                    "none": { "budget": 0, "level": "LOW" }
+                },
+                "default_effort": null
+            },
+            "timeouts": {
+                "connect_seconds": 10,
+                "read_seconds": 30
+            },
+            "compaction": {
+                "temperature": 0.1,
+                "preferred_targets": []
+            }
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field `sticky_routing`"));
     }
 
     #[test]

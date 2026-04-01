@@ -45,9 +45,6 @@
     "model_provider_priority": {
       "glm-5-turbo": []
     },
-    "sticky_routing": {
-      "enabled": true
-    }
   },
   "health": {
     "auth_failure_immediate_unhealthy": true,
@@ -95,9 +92,7 @@
   "auto_compaction": {
     "enabled": true,
     "max_attempts_per_request": 1,
-    "tail_items_to_keep": 8,
-    "compact_instructions": "Compact the conversation history for continued use. Preserve all tool and file context needed to continue the session.",
-    "summary_instructions": "Summarize the conversation history so far for continued use. Preserve key decisions, constraints, open tasks, file paths, and relevant technical details. Be concise but complete."
+    "tail_items_to_keep": 8
   },
   "compaction": {
     "temperature": 0.1,
