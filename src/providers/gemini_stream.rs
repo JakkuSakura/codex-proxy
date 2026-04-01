@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::schema::json_value::JsonValue;
 use crate::schema::openai::ChatRequest;
@@ -74,13 +74,18 @@ pub fn stream_responses_sse(
         ));
 
         let mut byte_stream = std::pin::pin!(byte_stream);
+        let mut line_buf = String::new();
         while let Some(chunk_result) = byte_stream.next().await {
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => { debug!("Stream error: {}", e); break; }
             };
             let text = String::from_utf8_lossy(&chunk);
-            for line in text.lines() {
+            line_buf.push_str(&text);
+            while let Some(nl) = line_buf.find('\n') {
+                let line = line_buf[..nl].trim_end_matches('\r').to_string();
+                line_buf = line_buf[nl + 1..].to_string();
+
                 if !line.starts_with("data: ") || line == "data: [DONE]" {
                     continue;
                 }
@@ -88,7 +93,10 @@ pub fn stream_responses_sse(
                 let data_str = &line[6..];
                 let chunk: GeminiChunk = match serde_json::from_str(data_str) {
                     Ok(d) => d,
-                    Err(_) => continue,
+                    Err(e) => {
+                        warn!("Gemini chunk parse failed: {e}, raw: {data_str}");
+                        continue;
+                    }
                 };
                 let resp_part = chunk.response();
 

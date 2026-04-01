@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::schema::json_value::JsonValue;
 use crate::schema::openai::ChatRequest;
@@ -43,6 +43,7 @@ pub fn stream_responses_sse(
         ));
 
         let mut byte_stream = std::pin::pin!(byte_stream);
+        let mut line_buf = String::new();
         while let Some(chunk_result) = byte_stream.next().await {
             let chunk = match chunk_result {
                 Ok(c) => c,
@@ -52,7 +53,11 @@ pub fn stream_responses_sse(
                 }
             };
             let text = String::from_utf8_lossy(&chunk);
-            for line in text.lines() {
+            line_buf.push_str(&text);
+            while let Some(nl) = line_buf.find('\n') {
+                let line = line_buf[..nl].trim_end_matches('\r').to_string();
+                line_buf = line_buf[nl + 1..].to_string();
+
                 if !line.starts_with("data: ") {
                     continue;
                 }
@@ -62,7 +67,10 @@ pub fn stream_responses_sse(
                 let data_str = &line[6..];
                 let data: ZaiStreamChunk = match serde_json::from_str(data_str) {
                     Ok(d) => d,
-                    Err(_) => continue,
+                    Err(e) => {
+                        warn!("ZAI chunk parse failed: {e}, raw: {data_str}");
+                        continue;
+                    }
                 };
                 debug!("ZAI STREAM DELTA: {}", data_str);
 
@@ -360,11 +368,34 @@ fn encode_event<T: Serialize>(seq_num: &mut u64, evt_type: &'static str, data: T
     Bytes::from(payload)
 }
 
+
+/// Deserialize a Vec field, treating null as empty vec.
+fn deserialize_null_default_vec<'de, T, D>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    T: serde::de::DeserializeOwned,
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    struct NullDefaultVec<T>(std::marker::PhantomData<T>);
+    impl<'de, T: serde::de::DeserializeOwned> Visitor<'de> for NullDefaultVec<T> {
+        type Value = Vec<T>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("Vec or null")
+        }
+        fn visit_none<E: de::Error>(self) -> Result<Vec<T>, E> { Ok(Vec::new()) }
+        fn visit_unit<E: de::Error>(self) -> Result<Vec<T>, E> { Ok(Vec::new()) }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Vec<T>, A::Error> {
+            serde::Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))
+        }
+    }
+    deserializer.deserialize_any(NullDefaultVec::<T>(std::marker::PhantomData))
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct ZaiStreamChunk {
     #[serde(default)]
     usage: Option<ZaiUsage>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default_vec")]
     choices: Vec<ZaiChoice>,
 }
 
@@ -388,7 +419,7 @@ struct ZaiChoice {
 struct ZaiDelta {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default_vec")]
     tool_calls: Vec<ZaiToolCallDelta>,
 }
 
