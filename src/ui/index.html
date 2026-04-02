@@ -334,6 +334,11 @@
               el("td", { class: "px-3 py-2", text: String(a.cache_key_hits ?? "") }),
               el("td", { class: "px-3 py-2 font-mono text-xs", text: a.unhealthy_until || "" }),
               el("td", {
+                class: "px-3 py-2 font-mono text-xs max-w-[520px] truncate",
+                title: a.last_error || "",
+                text: a.last_error || "",
+              }),
+              el("td", {
                 class: "px-3 py-2 font-mono text-xs",
                 text: a.auth?.api_key_masked || a.auth?.creds_path || a.auth?.auth_type || "",
               })
@@ -360,6 +365,7 @@
                       th("Failures"),
                       th("Cache hits"),
                       th("Unhealthy until"),
+                      th("Last error"),
                       th("Auth")
                     )
                   ),

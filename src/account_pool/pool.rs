@@ -63,6 +63,7 @@ struct AccountState {
     consecutive_failures: u32,
     cache_key_hits: AtomicU64,
     last_failure_at: Option<SystemTime>,
+    last_error: Option<String>,
     unhealthy_until: Option<SystemTime>,
     recovery_probe_due: bool,
     probe_in_progress: AtomicBool,
@@ -75,6 +76,7 @@ impl AccountState {
             consecutive_failures: 0,
             cache_key_hits: AtomicU64::new(0),
             last_failure_at: None,
+            last_error: None,
             unhealthy_until: Some(SystemTime::now()),
             recovery_probe_due: true,
             probe_in_progress: AtomicBool::new(false),
@@ -119,6 +121,7 @@ impl AccountPool {
                                 snapshot.cache_key_hits.load(Ordering::Relaxed),
                             ),
                             last_failure_at: snapshot.last_failure_at,
+                            last_error: snapshot.last_error.clone(),
                             unhealthy_until: snapshot.unhealthy_until,
                             recovery_probe_due: snapshot.recovery_probe_due,
                             probe_in_progress: AtomicBool::new(
@@ -179,7 +182,7 @@ impl AccountPool {
         !state.probe_in_progress.swap(true, Ordering::AcqRel)
     }
 
-    pub fn finish_recovery_probe(&self, index: usize, success: bool) {
+    pub fn finish_recovery_probe(&self, index: usize, success: bool, error: Option<&str>) {
         let guard = self.accounts.read();
         if let Some((account, state)) = guard.get(index) {
             let mut state = state.write();
@@ -187,6 +190,7 @@ impl AccountPool {
             if success {
                 state.alive = true;
                 state.consecutive_failures = 0;
+                state.last_error = None;
                 state.unhealthy_until = None;
                 state.recovery_probe_due = false;
                 info!(
@@ -196,7 +200,10 @@ impl AccountPool {
             } else {
                 let health = self.health.read().clone();
                 let now = SystemTime::now();
+                state.last_failure_at = Some(now);
+                state.last_error = error.map(str::to_string);
                 state.consecutive_failures += 1;
+                state.alive = false;
                 let backoff_factor = state
                     .consecutive_failures
                     .saturating_sub(1)
@@ -205,9 +212,14 @@ impl AccountPool {
                 let cooldown_seconds = health.cooldown_seconds.saturating_mul(cooldown_multiplier);
                 state.unhealthy_until = Some(now + Duration::from_secs(cooldown_seconds));
                 state.recovery_probe_due = true;
+                let reason = sanitize_error_for_log(error.unwrap_or("unknown"));
                 warn!(
-                    "Recovery probe failed for account {} ({}) next backoff={}s failures={}",
-                    account.id, account.provider, cooldown_seconds, state.consecutive_failures
+                    "Recovery probe failed for account {} ({}) reason={} next backoff={}s failures={}",
+                    account.id,
+                    account.provider,
+                    reason,
+                    cooldown_seconds,
+                    state.consecutive_failures
                 );
             }
         }
@@ -224,6 +236,7 @@ impl AccountPool {
                     consecutive_failures: state.consecutive_failures,
                     cache_key_hits: state.cache_key_hits.load(Ordering::Relaxed),
                     last_failure_at: state.last_failure_at,
+                    last_error: state.last_error.clone(),
                     unhealthy_until: state.unhealthy_until,
                     recovery_probe_due: state.recovery_probe_due,
                     probe_in_progress: state.probe_in_progress.load(Ordering::Relaxed),
@@ -245,6 +258,7 @@ impl AccountPool {
             let mut state = state.write();
             state.alive = true;
             state.consecutive_failures = 0;
+            state.last_error = None;
             state.unhealthy_until = None;
             state.recovery_probe_due = false;
             state.probe_in_progress.store(false, Ordering::Release);
@@ -255,13 +269,16 @@ impl AccountPool {
         }
     }
 
-    pub fn mark_failure(&self, index: usize, is_auth_error: bool) {
+    pub fn mark_failure(&self, index: usize, is_auth_error: bool, error: Option<&str>) {
         let guard = self.accounts.read();
         if let Some((account, state)) = guard.get(index) {
             let mut state = state.write();
             let health = self.health.read().clone();
             let now = SystemTime::now();
             state.last_failure_at = Some(now);
+            if let Some(error) = error {
+                state.last_error = Some(error.to_string());
+            }
             state.consecutive_failures += 1;
 
             let backoff_factor = state
@@ -313,6 +330,7 @@ impl AccountPool {
                     consecutive_failures: state.consecutive_failures,
                     cache_key_hits: state.cache_key_hits.load(Ordering::Relaxed),
                     last_failure_at: state.last_failure_at,
+                    last_error: state.last_error.clone(),
                     unhealthy_until: state.unhealthy_until,
                     recovery_probe_due: state.recovery_probe_due,
                     probe_in_progress: state.probe_in_progress.load(Ordering::Relaxed),
@@ -331,6 +349,7 @@ pub struct AccountSnapshot {
     pub consecutive_failures: u32,
     pub cache_key_hits: u64,
     pub last_failure_at: Option<SystemTime>,
+    pub last_error: Option<String>,
     pub unhealthy_until: Option<SystemTime>,
     pub recovery_probe_due: bool,
     pub probe_in_progress: bool,
@@ -360,9 +379,17 @@ pub struct AccountStatus {
     pub consecutive_failures: u32,
     pub cache_key_hits: u64,
     pub last_failure_at: Option<SystemTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
     pub unhealthy_until: Option<SystemTime>,
     pub recovery_probe_due: bool,
     pub probe_in_progress: bool,
+}
+
+fn sanitize_error_for_log(message: &str) -> String {
+    let mut out = message.replace('\n', "\\n").replace('\r', "\\r");
+    out.truncate(1024);
+    out
 }
 
 fn mask_auth(auth: &AccountAuth) -> MaskedAccountAuth {
@@ -440,10 +467,11 @@ mod tests {
         let pool = AccountPool::new();
         pool.load_accounts(vec![account("a", "openai", None, 1)]);
         pool.mark_success(0);
-        pool.mark_failure(0, false);
+        pool.mark_failure(0, false, Some("boom"));
         let (_, snapshot) = pool.get_account(0).unwrap();
         assert!(!snapshot.alive);
         assert!(snapshot.recovery_probe_due);
         assert!(snapshot.unhealthy_until.is_some());
+        assert_eq!(snapshot.last_error.as_deref(), Some("boom"));
     }
 }

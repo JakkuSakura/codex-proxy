@@ -99,14 +99,14 @@ async fn run_recovery_probe_pass(state: &AppState) {
         }
 
         let Some((account, snapshot)) = state.accounts().get_account(index) else {
-            state.accounts().finish_recovery_probe(index, false);
+            state.accounts().finish_recovery_probe(index, false, None);
             continue;
         };
 
         let Some(target) = with_config(state.config(), |cfg| {
             cfg.recovery_probe_target(&account.provider)
         }) else {
-            state.accounts().finish_recovery_probe(index, false);
+            state.accounts().finish_recovery_probe(index, false, None);
             if !snapshot.alive {
                 warn!(
                     "Recovery probe skipped for account index {} because provider '{}' has no configured probe target",
@@ -117,6 +117,7 @@ async fn run_recovery_probe_pass(state: &AppState) {
         };
 
         let provider_name = account.provider.clone();
+        let account_id = account.id.clone();
         let route = crate::account_pool::ResolvedRoute {
             requested_model: target.model.clone(),
             logical_model: target.model.clone(),
@@ -160,16 +161,33 @@ async fn run_recovery_probe_pass(state: &AppState) {
             config: state.config().clone(),
             gemini_auth: state.gemini_auth(),
         };
-        let success = provider
+        let result = provider
             .handle_request(raw, normalized, HeaderMap::new(), context)
-            .await
-            .is_ok();
-        state.accounts().finish_recovery_probe(index, success);
-
-        if !success && !snapshot.alive {
-            warn!("Recovery probe failed for account index {}", index);
-        }
+            .await;
+        let (success, error_reason) = match result {
+            Ok(_) => (true, None),
+            Err(err) => {
+                let reason = format_proxy_error(&err);
+                warn!(
+                    "Recovery probe request failed for account {} ({}) reason={}",
+                    account_id, provider_name, reason
+                );
+                (false, Some(reason))
+            }
+        };
+        state
+            .accounts()
+            .finish_recovery_probe(index, success, error_reason.as_deref());
     }
+}
+
+fn format_proxy_error(err: &ProxyError) -> String {
+    format!(
+        "{} ({}): {}",
+        err.error_code(),
+        err.status_code().as_u16(),
+        err
+    )
 }
 
 fn start_model_discovery_loop(state: &AppState) {
@@ -1530,9 +1548,12 @@ fn record_and_apply_result(
         }
         Err(error) => {
             let is_auth_error = is_auth_failure(&error);
-            state
-                .accounts()
-                .mark_failure(context.route.account_index, is_auth_error);
+            let reason = format_proxy_error(&error);
+            state.accounts().mark_failure(
+                context.route.account_index,
+                is_auth_error,
+                Some(reason.as_str()),
+            );
             Err(error)
         }
     }
