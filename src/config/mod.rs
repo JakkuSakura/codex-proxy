@@ -1,11 +1,12 @@
 use parking_lot::RwLock;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::account_pool::AccountAuth;
 use crate::error::ConfigError;
@@ -783,10 +784,20 @@ impl Config {
         let mut cfg = Self::defaults();
         let loaded = cfg.load_from_file();
         if !loaded {
-            panic!(
-                "No config file found. Refusing to start without an explicit config that includes an 'access' section."
-            );
+            let tried = default_config_search_paths(&dirs_home())
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            panic!("No config file found. Tried: {tried}");
         }
+        cfg.validate().expect("invalid configuration");
+        cfg
+    }
+
+    pub fn new_from_path(path: impl AsRef<Path>) -> Self {
+        let mut cfg = Self::defaults();
+        cfg.load_from_path(path.as_ref());
         cfg.validate().expect("invalid configuration");
         cfg
     }
@@ -944,25 +955,84 @@ impl Config {
         }
     }
 
+    fn load_from_path(&mut self, path: &Path) {
+        if !path.exists() {
+            panic!(
+                "Config {} does not exist. Refusing to start.",
+                path.display()
+            );
+        }
+        let content = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("Failed to read config {}: {e}", path.display()));
+        let file_cfg: FileConfig = parse_json_with_path(&content)
+            .unwrap_or_else(|e| panic!("Failed to parse config {}: {e}", path.display()));
+        if file_cfg.access.is_none() {
+            panic!(
+                "Config {} is missing required 'access' section. Refusing to start.",
+                path.display()
+            );
+        }
+
+        if let Some(server) = file_cfg.server {
+            self.server = server;
+        }
+        if let Some(providers) = file_cfg.providers {
+            self.providers = providers;
+        }
+        if let Some(models) = file_cfg.models {
+            self.models = models;
+        }
+        if let Some(model_discovery) = file_cfg.model_discovery {
+            self.model_discovery = model_discovery;
+        }
+        if let Some(model_metadata) = file_cfg.model_metadata {
+            self.model_metadata = model_metadata;
+        }
+        if let Some(models_endpoint) = file_cfg.models_endpoint {
+            self.models_endpoint = models_endpoint;
+        }
+        if let Some(session) = file_cfg.session {
+            self.session = session;
+        }
+        if let Some(auto_compaction) = file_cfg.auto_compaction {
+            self.auto_compaction = auto_compaction;
+        }
+        if let Some(routing) = file_cfg.routing {
+            self.routing = routing;
+        }
+        if let Some(health) = file_cfg.health {
+            self.health = health;
+        }
+        if let Some(accounts) = file_cfg.accounts {
+            self.accounts = accounts;
+        }
+        if let Some(access) = file_cfg.access {
+            self.access = access;
+        }
+        if let Some(reasoning) = file_cfg.reasoning {
+            self.reasoning = reasoning;
+        }
+        if let Some(timeouts) = file_cfg.timeouts {
+            self.timeouts = timeouts;
+        }
+        if let Some(compaction) = file_cfg.compaction {
+            self.compaction = compaction;
+        }
+
+        self.config_path = path.to_path_buf();
+        info!("Loaded config from {}", self.config_path.display());
+    }
+
     fn load_from_file(&mut self) -> bool {
         for path in default_config_search_paths(&dirs_home()) {
             if !path.exists() {
                 continue;
             }
-            let content = match fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("Failed to read config {}: {}", path.display(), e);
-                    continue;
-                }
-            };
-            let file_cfg: FileConfig = match serde_json::from_str(&content) {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    warn!("Failed to parse config {}: {}", path.display(), e);
-                    continue;
-                }
-            };
+            let content = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("Failed to read config {}: {e}", path.display()));
+            let file_cfg: FileConfig = parse_json_with_path(&content).unwrap_or_else(|e| {
+                panic!("Failed to parse config {}: {e}", path.display());
+            });
             if file_cfg.access.is_none() {
                 panic!(
                     "Config {} is missing required 'access' section. Refusing to start.",
@@ -1583,6 +1653,23 @@ fn dirs_home() -> PathBuf {
     env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/root"))
+}
+
+fn parse_json_with_path<T: DeserializeOwned>(content: &str) -> Result<T, String> {
+    let mut deserializer = serde_json::Deserializer::from_str(content);
+    let result: Result<T, _> = serde_path_to_error::deserialize(&mut deserializer);
+    match result {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let path = e.path().to_string();
+            let inner = e.into_inner();
+            if path.is_empty() {
+                Err(inner.to_string())
+            } else {
+                Err(format!("{inner} (at {path})"))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

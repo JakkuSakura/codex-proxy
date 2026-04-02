@@ -2,6 +2,7 @@ use codex_proxy::config::{Config, with_config};
 use codex_proxy::server::build_router;
 use codex_proxy::state::AppState;
 use parking_lot::RwLock;
+use std::env;
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::fmt::format::FmtSpan;
@@ -19,7 +20,11 @@ async fn main() {
 
     info!("Starting codex-proxy...");
 
-    let config = Config::new();
+    let config_path = parse_config_path_arg();
+    let config = match config_path {
+        Some(path) => Config::new_from_path(path),
+        None => Config::new(),
+    };
     let config_handle = Arc::new(RwLock::new(config));
     let addr = with_config(&config_handle, |cfg| {
         format!("{}:{}", cfg.server.host, cfg.server.port)
@@ -45,6 +50,22 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("Server error");
+}
+
+fn parse_config_path_arg() -> Option<String> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if let Some(rest) = arg.strip_prefix("--config=") {
+            return Some(rest.to_string());
+        }
+        if arg == "--config" {
+            let value = args.next().unwrap_or_else(|| {
+                panic!("--config expects a path, e.g. --config config/config.json.local");
+            });
+            return Some(value);
+        }
+    }
+    None
 }
 
 async fn shutdown_signal() {
