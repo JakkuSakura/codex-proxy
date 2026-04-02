@@ -129,6 +129,9 @@ pub struct ServerConfig {
 pub enum ProviderType {
     Gemini,
     Zai,
+    #[serde(rename = "openrouter", alias = "open_router")]
+    OpenRouter,
+    #[serde(rename = "openai", alias = "open_ai")]
     OpenAi,
 }
 
@@ -137,8 +140,15 @@ impl std::fmt::Display for ProviderType {
         f.write_str(match self {
             ProviderType::Gemini => "gemini",
             ProviderType::Zai => "zai",
+            ProviderType::OpenRouter => "openrouter",
             ProviderType::OpenAi => "openai",
         })
+    }
+}
+
+impl ProviderType {
+    pub fn is_openai_compatible(self) -> bool {
+        matches!(self, ProviderType::OpenAi | ProviderType::OpenRouter)
     }
 }
 
@@ -172,6 +182,8 @@ pub struct OpenAiProviderConfig {
     pub endpoints: HashMap<String, String>,
     #[serde(default)]
     pub models: Vec<String>,
+    #[serde(default)]
+    pub max_tokens_cap: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,7 +206,7 @@ pub enum ProviderConfig {
         #[serde(default)]
         models: Vec<String>,
     },
-    #[serde(alias = "openai")]
+    #[serde(rename = "openai", alias = "open_ai")]
     OpenAi {
         api_url: String,
         #[serde(default)]
@@ -203,6 +215,20 @@ pub enum ProviderConfig {
         endpoints: HashMap<String, String>,
         #[serde(default)]
         models: Vec<String>,
+        #[serde(default)]
+        max_tokens_cap: Option<u64>,
+    },
+    #[serde(rename = "openrouter", alias = "open_router")]
+    OpenRouter {
+        api_url: String,
+        #[serde(default)]
+        models_url: Option<String>,
+        #[serde(default)]
+        endpoints: HashMap<String, String>,
+        #[serde(default)]
+        models: Vec<String>,
+        #[serde(default)]
+        max_tokens_cap: Option<u64>,
     },
 }
 
@@ -212,6 +238,7 @@ impl ProviderConfig {
             ProviderConfig::Gemini { .. } => ProviderType::Gemini,
             ProviderConfig::Zai { .. } => ProviderType::Zai,
             ProviderConfig::OpenAi { .. } => ProviderType::OpenAi,
+            ProviderConfig::OpenRouter { .. } => ProviderType::OpenRouter,
         }
     }
 
@@ -219,7 +246,8 @@ impl ProviderConfig {
         match self {
             ProviderConfig::Gemini { models, .. }
             | ProviderConfig::Zai { models, .. }
-            | ProviderConfig::OpenAi { models, .. } => models,
+            | ProviderConfig::OpenAi { models, .. }
+            | ProviderConfig::OpenRouter { models, .. } => models,
         }
     }
 
@@ -266,11 +294,26 @@ impl ProviderConfig {
                 models_url,
                 endpoints,
                 models,
+                max_tokens_cap,
             } => Some(OpenAiProviderConfig {
                 api_url: api_url.clone(),
                 models_url: models_url.clone(),
                 endpoints: endpoints.clone(),
                 models: models.clone(),
+                max_tokens_cap: *max_tokens_cap,
+            }),
+            ProviderConfig::OpenRouter {
+                api_url,
+                models_url,
+                endpoints,
+                models,
+                max_tokens_cap,
+            } => Some(OpenAiProviderConfig {
+                api_url: api_url.clone(),
+                models_url: models_url.clone(),
+                endpoints: endpoints.clone(),
+                models: models.clone(),
+                max_tokens_cap: *max_tokens_cap,
             }),
             _ => None,
         }
@@ -292,6 +335,9 @@ impl ProviderConfig {
             ProviderConfig::OpenAi {
                 api_url, endpoints, ..
             }
+            | ProviderConfig::OpenRouter {
+                api_url, endpoints, ..
+            }
             | ProviderConfig::Zai {
                 api_url, endpoints, ..
             } => match endpoint {
@@ -309,6 +355,14 @@ impl ProviderConfig {
     pub fn models_url(&self, provider_name: &str) -> Option<String> {
         match self {
             ProviderConfig::OpenAi {
+                api_url,
+                models_url,
+                ..
+            } => models_url
+                .clone()
+                .or_else(|| infer_openai_models_url(api_url))
+                .or_else(|| Some(format!("{}/v1/models", api_url.trim_end_matches('/')))),
+            ProviderConfig::OpenRouter {
                 api_url,
                 models_url,
                 ..
@@ -351,6 +405,23 @@ impl ProviderConfig {
                 }
             }
             ProviderConfig::OpenAi {
+                api_url,
+                endpoints,
+                models_url,
+                ..
+            } => {
+                validate_url(api_url, &format!("Provider '{}' api_url", provider_name))?;
+                for (name, url) in endpoints {
+                    validate_url(
+                        url,
+                        &format!("Provider '{}' endpoint '{}'", provider_name, name),
+                    )?;
+                }
+                if let Some(url) = models_url {
+                    validate_url(url, &format!("Provider '{}' models_url", provider_name))?;
+                }
+            }
+            ProviderConfig::OpenRouter {
                 api_url,
                 endpoints,
                 models_url,
@@ -951,6 +1022,7 @@ impl Config {
                 models_url: None,
                 endpoints: HashMap::new(),
                 models: Vec::new(),
+                max_tokens_cap: None,
             },
         );
 
@@ -1305,7 +1377,10 @@ impl Config {
                         )));
                     }
                 }
-                (ProviderType::Zai | ProviderType::OpenAi, AccountAuth::ApiKey { api_key }) => {
+                (
+                    ProviderType::Zai | ProviderType::OpenAi | ProviderType::OpenRouter,
+                    AccountAuth::ApiKey { api_key },
+                ) => {
                     if api_key.is_empty() {
                         return Err(ConfigError::InvalidValue(format!(
                             "account '{}' has empty api_key auth",
@@ -1608,6 +1683,21 @@ impl Config {
             })
     }
 
+    pub fn openai_provider_config(
+        &self,
+        provider: &str,
+    ) -> Result<OpenAiProviderConfig, ConfigError> {
+        self.providers
+            .get(provider)
+            .and_then(ProviderConfig::as_openai)
+            .ok_or_else(|| {
+                ConfigError::InvalidValue(format!(
+                    "Provider '{}' is not configured as type openai",
+                    provider
+                ))
+            })
+    }
+
     fn validate_route_target(
         &self,
         target: &RouteTargetConfig,
@@ -1745,6 +1835,7 @@ mod tests {
                             "https://priority.openai.com/v1/responses".into(),
                         )]),
                         models: vec!["gpt-4.1".into(), "gpt-4.1-mini".into()],
+                        max_tokens_cap: None,
                     },
                 ),
                 (
@@ -1754,6 +1845,7 @@ mod tests {
                         models_url: None,
                         endpoints: HashMap::new(),
                         models: vec!["gpt-4.1".into()],
+                        max_tokens_cap: None,
                     },
                 ),
             ]),
@@ -2139,6 +2231,7 @@ mod tests {
                 models_url: None,
                 endpoints: HashMap::new(),
                 models: vec!["account-model".into(), "catalog-model".into()],
+                max_tokens_cap: None,
             },
         );
         cfg.routing.model_provider_priority.insert(
@@ -2176,6 +2269,7 @@ mod tests {
                 models_url: None,
                 endpoints: HashMap::new(),
                 models: vec!["account-model".into(), "other-model".into()],
+                max_tokens_cap: None,
             },
         );
         cfg.accounts.push(AccountConfig {
@@ -2203,6 +2297,7 @@ mod tests {
                 models_url: None,
                 endpoints: HashMap::new(),
                 models: vec!["catalog-model".into()],
+                max_tokens_cap: None,
             },
         );
         cfg.accounts.push(AccountConfig {

@@ -3,6 +3,7 @@ pub mod gemini;
 pub mod gemini_stream;
 pub mod gemini_utils;
 pub mod openai;
+pub mod openrouter;
 pub mod zai;
 pub mod zai_stream;
 
@@ -13,6 +14,7 @@ use crate::state::AppState;
 use base::Provider;
 use gemini::GeminiProvider;
 use openai::OpenAiProvider;
+use openrouter::OpenRouterProvider;
 use zai::ZAIProvider;
 
 pub struct ProviderRegistry {
@@ -25,6 +27,10 @@ impl ProviderRegistry {
         providers.insert(ProviderType::Gemini, Box::new(GeminiProvider::new()));
         providers.insert(ProviderType::Zai, Box::new(ZAIProvider::new()));
         providers.insert(ProviderType::OpenAi, Box::new(OpenAiProvider::new()));
+        providers.insert(
+            ProviderType::OpenRouter,
+            Box::new(OpenRouterProvider::new()),
+        );
         Self { providers }
     }
 
@@ -36,6 +42,7 @@ impl ProviderRegistry {
             ProviderType::Gemini => Box::new(GeminiProvider::new()),
             ProviderType::Zai => Box::new(ZAIProvider::new()),
             ProviderType::OpenAi => Box::new(OpenAiProvider::new()),
+            ProviderType::OpenRouter => Box::new(OpenRouterProvider::new()),
         }
     }
 }

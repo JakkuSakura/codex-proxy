@@ -13,6 +13,14 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
 }
 
+impl Clone for OpenAiProvider {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+        }
+    }
+}
+
 impl Default for OpenAiProvider {
     fn default() -> Self {
         Self::new()
@@ -148,7 +156,7 @@ impl OpenAiProvider {
             .await
     }
 
-    async fn forward_json_to(
+    pub(crate) async fn forward_json_to(
         &self,
         endpoint_url: &str,
         payload: Value,
@@ -190,7 +198,7 @@ impl OpenAiProvider {
             .map_err(|e| ProxyError::Internal(format!("Failed to build OpenAI response: {e}")))
     }
 
-    async fn forward_json(
+    pub(crate) async fn forward_json(
         &self,
         payload: Value,
         headers: HeaderMap,
@@ -243,6 +251,8 @@ impl Provider for OpenAiProvider {
         let mut payload =
             serde_json::to_value(raw_request).unwrap_or_else(|_| Value::Object(Default::default()));
         strip_null_object_fields(&mut payload);
+        ensure_max_output_tokens(&mut payload);
+        clamp_max_tokens(&mut payload, &context);
         apply_openai_route_overrides(&mut payload, &context);
         Box::pin(async move { self.forward_json(payload, headers, &context).await })
     }
@@ -317,7 +327,10 @@ impl Provider for OpenAiProvider {
     }
 }
 
-fn apply_openai_route_overrides(payload: &mut Value, context: &ProviderExecutionContext) {
+pub(crate) fn apply_openai_route_overrides(
+    payload: &mut Value,
+    context: &ProviderExecutionContext,
+) {
     let Some(object) = payload.as_object_mut() else {
         return;
     };
@@ -361,7 +374,7 @@ fn budget_to_effort(budget: u64) -> &'static str {
     }
 }
 
-fn strip_null_object_fields(value: &mut Value) {
+pub(crate) fn strip_null_object_fields(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.retain(|_, v| !v.is_null());
@@ -376,6 +389,49 @@ fn strip_null_object_fields(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+pub(crate) fn ensure_max_output_tokens(payload: &mut Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    if object.contains_key("max_output_tokens") {
+        return;
+    }
+    let Some(max_tokens) = object.get("max_tokens").and_then(Value::as_u64) else {
+        return;
+    };
+    object.insert(
+        "max_output_tokens".to_string(),
+        Value::Number(max_tokens.into()),
+    );
+}
+
+pub(crate) fn clamp_max_tokens(payload: &mut Value, context: &ProviderExecutionContext) {
+    let cap = with_config(&context.config, |cfg| {
+        cfg.openai_provider_config(context.provider())
+            .ok()
+            .and_then(|cfg| cfg.max_tokens_cap)
+    });
+    let Some(cap) = cap else { return };
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    clamp_u64_field(object, "max_tokens", cap);
+    clamp_u64_field(object, "max_output_tokens", cap);
+}
+
+fn clamp_u64_field(object: &mut serde_json::Map<String, Value>, field: &str, cap: u64) {
+    let Some(value) = object.get(field) else {
+        return;
+    };
+    let Some(current) = value.as_u64() else {
+        return;
+    };
+    if current <= cap {
+        return;
+    }
+    object.insert(field.to_string(), Value::Number(cap.into()));
 }
 
 #[cfg(test)]
@@ -406,6 +462,29 @@ mod strip_nulls_tests {
         assert!(!obj.contains_key("tools"));
         assert!(!obj.contains_key("tool_choice"));
     }
+
+    #[test]
+    fn infers_max_output_tokens_from_max_tokens() {
+        let req = ResponsesRequest {
+            model: "gpt-4.1".into(),
+            input: Some(ResponsesInput::Text("hi".into())),
+            instructions: None,
+            previous_response_id: None,
+            store: None,
+            metadata: None,
+            tools: None,
+            tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: Some(7),
+            stream: None,
+            include: None,
+        };
+        let mut payload = serde_json::to_value(req).expect("request must serialize");
+        strip_null_object_fields(&mut payload);
+        ensure_max_output_tokens(&mut payload);
+        assert_eq!(payload["max_output_tokens"].as_u64(), Some(7));
+    }
 }
 
 #[cfg(test)]
@@ -432,6 +511,7 @@ mod tests {
                 models_url: None,
                 endpoints: HashMap::new(),
                 models: Vec::new(),
+                max_tokens_cap: None,
             },
         )]);
         let cfg = crate::config::Config {
@@ -553,5 +633,93 @@ mod tests {
             }),
             "minimal"
         );
+    }
+
+    #[test]
+    fn clamps_max_tokens_when_cap_configured() {
+        let mut payload = json!({
+            "model": "placeholder",
+            "input": "hi",
+            "max_tokens": 65536
+        });
+
+        let providers: ProvidersConfig = HashMap::from([(
+            "openrouter".into(),
+            ProviderConfig::OpenAi {
+                api_url: "https://openrouter.example/v1/responses".into(),
+                models_url: None,
+                endpoints: HashMap::new(),
+                models: vec!["z-ai/glm-5-turbo".into()],
+                max_tokens_cap: Some(10_000),
+            },
+        )]);
+
+        let cfg = crate::config::Config {
+            config_path: PathBuf::from("/tmp/test-config.json"),
+            server: ServerConfig {
+                host: "127.0.0.1".into(),
+                port: 8765,
+                log_level: "INFO".into(),
+            },
+            providers,
+            models: ModelsConfig {
+                served: Vec::new(),
+                fallback_models: HashMap::new(),
+            },
+            model_discovery: crate::config::ModelDiscoveryConfig::default(),
+            model_metadata: crate::config::ProviderModelMetadataConfig::new(),
+            models_endpoint: crate::config::ModelsEndpointConfig::default(),
+            session: crate::config::SessionConfig::default(),
+            auto_compaction: crate::config::AutoCompactionConfig::default(),
+            routing: RoutingConfig {
+                model_overrides: HashMap::new(),
+                model_provider_priority: HashMap::new(),
+            },
+            health: RoutingHealthConfig::default(),
+            accounts: Vec::new(),
+            access: AccessControlConfig::default(),
+            reasoning: ReasoningConfig::default(),
+            timeouts: TimeoutsConfig {
+                connect_seconds: 10,
+                read_seconds: 30,
+            },
+            compaction: CompactionConfig {
+                temperature: 0.1,
+                preferred_targets: Vec::new(),
+            },
+        };
+
+        let config = Arc::new(RwLock::new(cfg));
+        let gemini_auth = Arc::new(crate::auth::GeminiAuthManager::new(config.clone()));
+        let context = ProviderExecutionContext {
+            route: ResolvedRoute {
+                requested_model: "glm-5-turbo".into(),
+                logical_model: "glm-5-turbo".into(),
+                upstream_model: "z-ai/glm-5-turbo".into(),
+                endpoint: None,
+                provider: "openrouter".into(),
+                account_index: 0,
+                account_id: "openrouter-main".into(),
+                cache_hit: false,
+                cache_key: 0,
+                preferred_target_index: 0,
+                reasoning: None,
+            },
+            account: Account {
+                id: "openrouter-main".into(),
+                provider: "openrouter".into(),
+                auth: AccountAuth::ApiKey {
+                    api_key: "sk-test".into(),
+                },
+                enabled: true,
+                weight: 1,
+                models: None,
+            },
+            config,
+            gemini_auth,
+        };
+
+        clamp_max_tokens(&mut payload, &context);
+        assert_eq!(payload["max_tokens"].as_u64(), Some(10_000));
     }
 }

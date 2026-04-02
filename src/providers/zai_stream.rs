@@ -11,10 +11,10 @@ use tracing::{debug, warn};
 use crate::schema::json_value::JsonValue;
 use crate::schema::openai::ChatRequest;
 use crate::schema::sse::{
-    FailedResponseObject, ResponseError, ResponseFailedData,
-    FunctionCallItem, LocalShellCallItem, MessageItem, OutputContentPart, OutputItem,
-    ResponseCompletedData, ResponseCreatedData, ResponseEvent, ResponseObject,
-    ResponseOutputItemAddedData, ResponseOutputItemDoneData, ResponseOutputTextDeltaData, Usage,
+    FailedResponseObject, FunctionCallItem, LocalShellCallItem, MessageItem, OutputContentPart,
+    OutputItem, ResponseCompletedData, ResponseCreatedData, ResponseError, ResponseEvent,
+    ResponseFailedData, ResponseObject, ResponseOutputItemAddedData, ResponseOutputItemDoneData,
+    ResponseOutputTextDeltaData, Usage,
 };
 
 pub fn stream_responses_sse(

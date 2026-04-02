@@ -40,6 +40,15 @@
 
       function fmtTs(ts) {
         if (!ts) return "";
+        if (typeof ts === "object") {
+          const secs = ts.secs_since_epoch ?? ts.secs ?? ts.seconds ?? null;
+          const nanos = ts.nanos_since_epoch ?? ts.nanos ?? 0;
+          if (typeof secs === "number") {
+            const d = new Date(secs * 1000 + nanos / 1e6);
+            return isNaN(d.getTime()) ? maskError(ts) : d.toLocaleString();
+          }
+          return maskError(ts);
+        }
         try {
           return new Date(ts * 1000).toLocaleString();
         } catch {
@@ -332,7 +341,7 @@
               el("td", { class: "px-3 py-2" }, badge(!!a.alive, "healthy", "unhealthy")),
               el("td", { class: "px-3 py-2", text: String(a.consecutive_failures ?? "") }),
               el("td", { class: "px-3 py-2", text: String(a.cache_key_hits ?? "") }),
-              el("td", { class: "px-3 py-2 font-mono text-xs", text: a.unhealthy_until || "" }),
+              el("td", { class: "px-3 py-2 font-mono text-xs", text: fmtTs(a.unhealthy_until) }),
               el("td", {
                 class: "px-3 py-2 font-mono text-xs max-w-[520px] truncate",
                 title: a.last_error || "",

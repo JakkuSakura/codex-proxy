@@ -530,7 +530,7 @@ async fn compact_handler(
     let route = resolve_compaction_route(&state, &normalized.messages, None)?;
     let provider_type = with_config(state.config(), |cfg| cfg.provider_type(&route.provider))
         .map_err(ProxyError::Config)?;
-    if provider_type != crate::config::ProviderType::OpenAi {
+    if !provider_type.is_openai_compatible() {
         return Err(ProxyError::NotImplemented(format!(
             "Compaction is only supported for OpenAI-compatible providers; resolved provider '{}' does not support native compaction",
             route.provider
@@ -766,7 +766,7 @@ async fn auto_compact_request(
     let tail_items = items[items.len() - tail..].to_vec();
 
     let rewritten_items = match provider_type {
-        crate::config::ProviderType::OpenAi => {
+        crate::config::ProviderType::OpenAi | crate::config::ProviderType::OpenRouter => {
             let encrypted = run_native_compaction(
                 state,
                 prefix_items,
@@ -861,7 +861,7 @@ async fn run_native_compaction(
     let route = resolve_compaction_route(state, normalized_messages, cache_key_override)?;
     let provider_type = with_config(state.config(), |cfg| cfg.provider_type(&route.provider))
         .map_err(ProxyError::Config)?;
-    if provider_type != crate::config::ProviderType::OpenAi {
+    if !provider_type.is_openai_compatible() {
         return Err(ProxyError::NotImplemented(
             "Native compaction requires an OpenAI-compatible compaction provider".into(),
         ));
@@ -932,7 +932,7 @@ async fn run_summary_compaction(
     let route = resolve_compaction_route(state, normalized_messages, cache_key_override)?;
     let provider_type = with_config(state.config(), |cfg| cfg.provider_type(&route.provider))
         .map_err(ProxyError::Config)?;
-    if provider_type != crate::config::ProviderType::OpenAi {
+    if !provider_type.is_openai_compatible() {
         return Err(ProxyError::NotImplemented(
             "Summary compaction requires an OpenAI-compatible compaction provider".into(),
         ));
@@ -1073,6 +1073,7 @@ mod auto_compaction_tests {
                         models_url: None,
                         endpoints: HashMap::new(),
                         models: vec!["real-routed-model".into()],
+                        max_tokens_cap: None,
                     },
                 ),
                 (
@@ -1082,6 +1083,7 @@ mod auto_compaction_tests {
                         models_url: None,
                         endpoints: HashMap::new(),
                         models: Vec::new(),
+                        max_tokens_cap: None,
                     },
                 ),
             ]),
