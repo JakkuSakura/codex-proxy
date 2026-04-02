@@ -75,6 +75,7 @@ pub fn stream_responses_sse(
 
         let mut byte_stream = std::pin::pin!(byte_stream);
         let mut line_buf = String::new();
+        let mut saw_done = false;
         while let Some(chunk_result) = byte_stream.next().await {
             let chunk = match chunk_result {
                 Ok(c) => c,
@@ -82,12 +83,22 @@ pub fn stream_responses_sse(
             };
             let text = String::from_utf8_lossy(&chunk);
             line_buf.push_str(&text);
+
+            // Some providers may omit the trailing newline for the final DONE sentinel.
+            if line_buf.trim_end_matches('\r') == "data: [DONE]" {
+                break;
+            }
+
             while let Some(nl) = line_buf.find('\n') {
                 let line = line_buf[..nl].trim_end_matches('\r').to_string();
                 line_buf = line_buf[nl + 1..].to_string();
 
-                if !line.starts_with("data: ") || line == "data: [DONE]" {
+                if !line.starts_with("data: ") {
                     continue;
+                }
+                if line == "data: [DONE]" {
+                    saw_done = true;
+                    break;
                 }
 
                 let data_str = &line[6..];
@@ -297,6 +308,10 @@ pub fn stream_responses_sse(
                         }
                     }
                 }
+            }
+
+            if saw_done {
+                break;
             }
         }
 
