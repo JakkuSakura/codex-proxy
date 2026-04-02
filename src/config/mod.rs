@@ -1475,43 +1475,11 @@ impl Config {
             }
         }
 
-        for (requested_model, fallback_model) in &self.models.fallback_models {
-            if fallback_model.trim().is_empty() {
-                return Err(ConfigError::InvalidValue(format!(
-                    "models.fallback_models['{}'] must not be empty",
-                    requested_model
-                )));
-            }
-            if !self
-                .routing
-                .model_provider_priority
-                .contains_key(fallback_model)
-            {
-                return Err(ConfigError::InvalidValue(format!(
-                    "models.fallback_models['{}'] target '{}' is not defined in routing.model_provider_priority",
-                    requested_model, fallback_model
-                )));
-            }
-            if requested_model != "*"
-                && self
-                    .routing
-                    .model_provider_priority
-                    .contains_key(requested_model)
-            {
-                return Err(ConfigError::InvalidValue(format!(
-                    "models.fallback_models['{}'] conflicts with routing.model_provider_priority['{}'] (model has direct routing targets so fallback never applies)",
-                    requested_model, requested_model
-                )));
-            }
-        }
-
-        if let Some(override_wildcard) = self.routing.model_overrides.get("*")
-            && self.models.fallback_models.contains_key("*")
-        {
-            return Err(ConfigError::InvalidValue(format!(
-                "routing.model_overrides['*']='{}' conflicts with models.fallback_models['*'] (choose exactly one wildcard fallback mechanism)",
-                override_wildcard
-            )));
+        if !self.models.fallback_models.is_empty() {
+            return Err(ConfigError::InvalidValue(
+                "models.fallback_models is deprecated; use routing.model_overrides + routing.model_provider_priority instead"
+                    .to_string(),
+            ));
         }
 
         if !self.models.served.is_empty() {
@@ -1545,7 +1513,6 @@ impl Config {
     /// 1) `routing.model_overrides[requested_model]` (exact)
     /// 2) `routing.model_provider_priority[requested_model]` (treat requested as a physical routing key)
     /// 3) `routing.model_overrides["*"]` (wildcard)
-    /// 4) `models.fallback_models[requested_model]` then `models.fallback_models["*"]`
     pub fn route_targets_for_model(
         &self,
         requested_model: &str,
@@ -1567,16 +1534,7 @@ impl Config {
                 return Some((mapped_model.clone(), targets.as_slice()));
             }
         }
-
-        let fallback_model = self
-            .models
-            .fallback_models
-            .get(requested_model)
-            .or_else(|| self.models.fallback_models.get("*"))?;
-        self.routing
-            .model_provider_priority
-            .get(fallback_model)
-            .map(|targets| (fallback_model.clone(), targets.as_slice()))
+        None
     }
 
     pub fn preferred_targets_for_model(
@@ -2348,15 +2306,27 @@ mod tests {
     }
 
     #[test]
-    fn fallback_models_apply_when_no_overrides_or_physical_entry() {
+    fn route_targets_use_wildcard_override_when_no_physical_entry() {
         let mut cfg = base_config();
-        cfg.routing.model_overrides = HashMap::new();
-        cfg.models.fallback_models = HashMap::from([("*".into(), "claude-sonnet-4-6".into())]);
+        cfg.routing
+            .model_overrides
+            .insert("*".into(), "claude-sonnet-4-6".into());
 
         let (logical_model, targets) = cfg.route_targets_for_model("unmapped-model").unwrap();
         assert_eq!(logical_model, "claude-sonnet-4-6");
         assert_eq!(targets[0].provider, "tabcode");
         assert_eq!(targets[0].model, "gpt-4.1");
+    }
+
+    #[test]
+    fn rejects_fallback_models_config() {
+        let mut cfg = base_config();
+        cfg.models
+            .fallback_models
+            .insert("*".into(), "claude-sonnet-4-6".into());
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("models.fallback_models is deprecated"));
     }
 
     #[test]
@@ -2387,50 +2357,6 @@ mod tests {
 
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("routing.model_overrides['gpt-4.1-mini'] conflicts with routing.model_provider_priority['gpt-4.1-mini']"));
-    }
-
-    #[test]
-    fn fallback_models_conflicts_with_direct_physical_entry() {
-        let mut cfg = base_config();
-        cfg.routing.model_provider_priority.insert(
-            "gpt-4.1-mini".into(),
-            vec![RouteTargetConfig {
-                provider: "openai".into(),
-                model: "gpt-4.1-mini".into(),
-                endpoint: None,
-                reasoning: None,
-            }],
-        );
-        cfg.accounts.push(AccountConfig {
-            id: "openai-a".into(),
-            provider: "openai".into(),
-            enabled: true,
-            weight: 1,
-            models: Some(vec!["gpt-4.1-mini".into()]),
-            auth: AccountAuth::ApiKey {
-                api_key: "sk-test".into(),
-            },
-        });
-        cfg.models
-            .fallback_models
-            .insert("gpt-4.1-mini".into(), "claude-sonnet-4-6".into());
-
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("models.fallback_models['gpt-4.1-mini'] conflicts with routing.model_provider_priority['gpt-4.1-mini']"));
-    }
-
-    #[test]
-    fn wildcard_override_and_wildcard_fallback_models_conflict() {
-        let mut cfg = base_config();
-        cfg.routing
-            .model_overrides
-            .insert("*".into(), "claude-sonnet-4-6".into());
-        cfg.models
-            .fallback_models
-            .insert("*".into(), "claude-sonnet-4-6".into());
-
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("routing.model_overrides['*']='claude-sonnet-4-6' conflicts with models.fallback_models['*']"));
     }
 
     #[test]
