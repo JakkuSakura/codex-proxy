@@ -149,7 +149,7 @@ async fn run_recovery_probe_pass(state: &AppState) {
             tool_choice: None,
             temperature: None,
             top_p: None,
-            max_tokens: Some(1),
+            max_tokens: (provider_name == "openrouter").then_some(1),
             stream: Some(false),
             include: None,
         };
@@ -1381,7 +1381,7 @@ mod auto_compaction_tests {
             tool_choice: None,
             temperature: None,
             top_p: None,
-            max_tokens: Some(1),
+            max_tokens: None,
             stream: Some(false),
             include: None,
         };

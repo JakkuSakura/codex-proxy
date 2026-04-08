@@ -274,6 +274,7 @@ impl AccountPool {
         if let Some((account, state)) = guard.get(index) {
             let mut state = state.write();
             let health = self.health.read().clone();
+            let threshold = health.failure_threshold.max(1);
             let now = SystemTime::now();
             state.last_failure_at = Some(now);
             if let Some(error) = error {
@@ -284,12 +285,12 @@ impl AccountPool {
             let backoff_factor = state
                 .consecutive_failures
                 .saturating_sub(1)
-                .min(health.failure_threshold.saturating_sub(1));
+                .min(threshold.saturating_sub(1));
             let cooldown_multiplier = 1u64 << backoff_factor;
             let cooldown_seconds = health.cooldown_seconds.saturating_mul(cooldown_multiplier);
 
             let should_mark_unhealthy = (is_auth_error && health.auth_failure_immediate_unhealthy)
-                || state.consecutive_failures >= 1;
+                || state.consecutive_failures >= threshold;
             if should_mark_unhealthy {
                 state.alive = false;
                 state.recovery_probe_due = true;
@@ -302,6 +303,17 @@ impl AccountPool {
                     state.consecutive_failures,
                     is_auth_error,
                     cooldown_seconds
+                );
+            } else {
+                state.alive = true;
+                state.recovery_probe_due = false;
+                state.unhealthy_until = None;
+                debug!(
+                    "Account {} ({}) recorded failure {}/{} but remains healthy",
+                    account.id,
+                    account.provider,
+                    state.consecutive_failures,
+                    threshold
                 );
             }
         }
@@ -463,15 +475,44 @@ mod tests {
     }
 
     #[test]
-    fn marks_account_unhealthy_on_first_failure() {
+    fn keeps_account_healthy_until_failure_threshold_is_reached() {
         let pool = AccountPool::new();
         pool.load_accounts(vec![account("a", "openai", None, 1)]);
         pool.mark_success(0);
-        pool.mark_failure(0, false, Some("boom"));
+
+        pool.mark_failure(0, false, Some("boom-1"));
+        let (_, snapshot) = pool.get_account(0).unwrap();
+        assert!(snapshot.alive);
+        assert!(!snapshot.recovery_probe_due);
+        assert!(snapshot.unhealthy_until.is_none());
+        assert_eq!(snapshot.consecutive_failures, 1);
+        assert_eq!(snapshot.last_error.as_deref(), Some("boom-1"));
+
+        pool.mark_failure(0, false, Some("boom-2"));
+        let (_, snapshot) = pool.get_account(0).unwrap();
+        assert!(snapshot.alive);
+        assert_eq!(snapshot.consecutive_failures, 2);
+
+        pool.mark_failure(0, false, Some("boom-3"));
         let (_, snapshot) = pool.get_account(0).unwrap();
         assert!(!snapshot.alive);
         assert!(snapshot.recovery_probe_due);
         assert!(snapshot.unhealthy_until.is_some());
-        assert_eq!(snapshot.last_error.as_deref(), Some("boom"));
+        assert_eq!(snapshot.consecutive_failures, 3);
+        assert_eq!(snapshot.last_error.as_deref(), Some("boom-3"));
+    }
+
+    #[test]
+    fn marks_auth_failure_unhealthy_immediately() {
+        let pool = AccountPool::new();
+        pool.load_accounts(vec![account("a", "openai", None, 1)]);
+        pool.mark_success(0);
+        pool.mark_failure(0, true, Some("auth boom"));
+        let (_, snapshot) = pool.get_account(0).unwrap();
+        assert!(!snapshot.alive);
+        assert!(snapshot.recovery_probe_due);
+        assert!(snapshot.unhealthy_until.is_some());
+        assert_eq!(snapshot.consecutive_failures, 1);
+        assert_eq!(snapshot.last_error.as_deref(), Some("auth boom"));
     }
 }
