@@ -1,5 +1,5 @@
-use crate::schema::json_value::JsonValue;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -19,7 +19,7 @@ pub struct ResponsesRequest {
     pub store: Option<bool>,
 
     #[serde(default)]
-    pub metadata: Option<BTreeMap<String, JsonValue>>,
+    pub metadata: Option<BTreeMap<String, Value>>,
 
     #[serde(default)]
     pub tools: Option<Vec<Tool>>,
@@ -100,13 +100,13 @@ pub struct InputItem {
     pub thought: Option<String>,
 
     #[serde(default)]
-    pub arguments: Option<JsonValue>,
+    pub arguments: Option<Value>,
 
     #[serde(default)]
-    pub input: Option<JsonValue>,
+    pub input: Option<Value>,
 
     #[serde(default)]
-    pub action: Option<JsonValue>,
+    pub action: Option<Value>,
 
     #[serde(default)]
     pub command: Option<String>,
@@ -144,7 +144,7 @@ pub struct FileChange {
 pub enum Content {
     Text(String),
     Parts(Vec<ContentPart>),
-    Json(JsonValue),
+    Json(Value),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -173,7 +173,7 @@ pub struct Tool {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    pub parameters: Option<JsonValue>,
+    pub parameters: Option<Value>,
     #[serde(default)]
     pub strict: Option<bool>,
 
@@ -196,7 +196,7 @@ pub struct FunctionDef {
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    pub parameters: Option<JsonValue>,
+    pub parameters: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -218,7 +218,7 @@ pub struct ChatRequest {
     #[serde(default)]
     pub store: bool,
     #[serde(default)]
-    pub metadata: BTreeMap<String, JsonValue>,
+    pub metadata: BTreeMap<String, Value>,
     #[serde(default)]
     pub previous_response_id: Option<String>,
 

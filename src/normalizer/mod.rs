@@ -1,5 +1,5 @@
-use crate::schema::json_value::JsonValue;
 use crate::schema::openai::{
+
     ChatContent, ChatMessage, ChatRequest, Content, InputItem, Instructions, ResponsesInput,
     ResponsesRequest, TextPart, Tool, ToolCall, ToolCallFunction,
 };
@@ -203,8 +203,8 @@ fn process_tool_call(item: &InputItem, messages: &mut Vec<ChatMessage>) {
     }
 }
 
-fn args_to_json_string(args: Option<&JsonValue>, item_type: &str, item: &InputItem) -> String {
-    if let Some(JsonValue::String(s)) = args {
+fn args_to_json_string(args: Option<&serde_json::Value>, item_type: &str, item: &InputItem) -> String {
+    if let Some(serde_json::Value::String(s)) = args {
         return s.clone();
     }
     if let Some(v) = args {
@@ -226,11 +226,11 @@ fn args_to_json_string(args: Option<&JsonValue>, item_type: &str, item: &InputIt
                 .action
                 .as_ref()
                 .and_then(|a| match a {
-                    JsonValue::Object(m) => m.get("exec"),
+                    serde_json::Value::Object(m) => m.get("exec"),
                     _ => None,
                 })
                 .and_then(|exec| match exec {
-                    JsonValue::Object(m) => m.get("command"),
+                    serde_json::Value::Object(m) => m.get("command"),
                     _ => None,
                 })
                 .map(|v| serde_json::to_string(v).unwrap_or_default())

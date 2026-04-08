@@ -9,8 +9,9 @@ use crate::account_pool::AccountAuth;
 use crate::config::{EffectiveReasoningConfig, with_config};
 use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
-use crate::schema::json_value::JsonValue;
+use crate::schema::common::from_chat_request;
 use crate::schema::openai::{
+
     ChatContent, ChatMessage, ChatRequest, ResponsesRequest, Tool, ToolCall,
 };
 use crate::schema::sse::{
@@ -72,7 +73,8 @@ impl ZAIProvider {
         context: &ProviderExecutionContext,
     ) -> Result<Response<Body>, ProxyError> {
         let auth = resolve_zai_auth(headers, context)?;
-        let zai_req = to_zai_chat_request(req, context.upstream_model(), context.reasoning());
+        let common = from_chat_request(req);
+        let zai_req = to_zai_chat_request(req, &common, context.upstream_model(), context.reasoning());
         let resp = self.post_json(&zai_req, auth, context).await?;
         let status = resp.status();
         info!("Z.AI response status: {}", status);
@@ -226,6 +228,7 @@ fn resolve_zai_auth(
 
 fn to_zai_chat_request(
     req: &ChatRequest,
+    _common: &fp_agent::AgentRequest,
     model: &str,
     reasoning: Option<&EffectiveReasoningConfig>,
 ) -> ZaiChatRequest {
@@ -343,7 +346,7 @@ struct ZaiToolCallFn {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    arguments: Option<JsonValue>,
+    arguments: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -457,10 +460,10 @@ fn map_zai_response_to_responses_api(z: &ZaiChatResponse) -> ResponseObject {
 }
 
 fn extract_command_from_args(args: &str) -> Vec<String> {
-    let parsed: Result<JsonValue, _> = serde_json::from_str(args);
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(args);
     match parsed {
-        Ok(JsonValue::Object(map)) => match map.get("command") {
-            Some(JsonValue::Array(arr)) => arr
+        Ok(serde_json::Value::Object(map)) => match map.get("command") {
+            Some(serde_json::Value::Array(arr)) => arr
                 .iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect(),

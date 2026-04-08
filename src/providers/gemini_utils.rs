@@ -1,11 +1,11 @@
-use crate::schema::json_value::JsonValue;
 use crate::schema::openai::{ChatContent, ChatMessage};
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashMap;
 
-pub fn sanitize_params(params: &JsonValue) -> JsonValue {
+pub fn sanitize_params(params: &Value) -> Value {
     match params {
-        JsonValue::Object(map) => {
+        Value::Object(map) => {
             let filtered = map
                 .iter()
                 .filter(|(k, _)| {
@@ -21,9 +21,9 @@ pub fn sanitize_params(params: &JsonValue) -> JsonValue {
                 })
                 .map(|(k, v)| (k.clone(), sanitize_params(v)))
                 .collect();
-            JsonValue::Object(filtered)
+            Value::Object(filtered)
         }
-        JsonValue::Array(arr) => JsonValue::Array(arr.iter().map(sanitize_params).collect()),
+        Value::Array(arr) => Value::Array(arr.iter().map(sanitize_params).collect()),
         other => other.clone(),
     }
 }
@@ -60,7 +60,7 @@ pub struct GeminiPart {
 #[derive(Clone, Debug, Serialize)]
 pub struct GeminiFunctionCall {
     pub name: String,
-    pub args: JsonValue,
+    pub args: Value,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -76,6 +76,7 @@ pub struct GeminiFunctionResponseBody {
 
 pub fn map_messages(
     messages: &[ChatMessage],
+    _common: &fp_agent::AgentRequest,
     _model_name: &str,
 ) -> (Vec<GeminiContent>, Option<GeminiSystemInstruction>) {
     let mut contents: Vec<GeminiContent> = Vec::new();
@@ -129,8 +130,8 @@ pub fn map_messages(
         }
 
         for tc in &m.tool_calls {
-            let args: JsonValue = serde_json::from_str(&tc.function.arguments)
-                .unwrap_or(JsonValue::Object(Default::default()));
+            let args: Value = serde_json::from_str(&tc.function.arguments)
+                .unwrap_or(Value::Object(Default::default()));
             let thought_sig = m
                 .thought_signature
                 .as_deref()

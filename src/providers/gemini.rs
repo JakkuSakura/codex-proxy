@@ -9,8 +9,9 @@ use crate::auth::AuthType;
 use crate::config::with_config;
 use crate::error::ProxyError;
 use crate::providers::base::{Provider, ProviderExecutionContext};
-use crate::schema::json_value::JsonValue;
+use crate::schema::common::from_chat_request;
 use crate::schema::openai::{ChatRequest, ResponsesRequest};
+use serde_json::Value;
 
 pub struct GeminiProvider {
     client: reqwest::Client,
@@ -40,7 +41,8 @@ impl GeminiProvider {
             .await?;
         let model = context.upstream_model();
 
-        let (contents, system_instruction) = map_messages(&req_data.messages, model);
+        let common = from_chat_request(req_data);
+        let (contents, system_instruction) = map_messages(&req_data.messages, &common, model);
         let temperature = req_data.temperature.unwrap_or(1.0);
         let top_p = req_data.top_p.unwrap_or(1.0);
         let max_tokens = req_data.max_tokens;
@@ -232,7 +234,7 @@ struct GeminiFunctionDeclaration {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
-    parameters: JsonValue,
+    parameters: Value,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -294,7 +296,7 @@ fn apply_tools(req_data: &ChatRequest) -> (Option<Vec<GeminiTool>>, Option<Gemin
             .parameters
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| JsonValue::Object(Default::default()));
+            .unwrap_or_else(|| Value::Object(Default::default()));
         tool_decls.push(GeminiFunctionDeclaration {
             name: func.name.clone(),
             description: func.description.clone(),

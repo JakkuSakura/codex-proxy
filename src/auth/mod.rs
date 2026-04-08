@@ -1,8 +1,8 @@
 use crate::account_pool::{Account, AccountAuth};
 use crate::config::{ConfigHandle, with_config};
 use crate::error::ProxyError;
-use crate::schema::json_value::JsonValue;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -106,7 +106,7 @@ struct PollOperationResponse {
     #[serde(default)]
     done: bool,
     #[serde(default)]
-    error: Option<JsonValue>,
+    error: Option<Value>,
     #[serde(default)]
     response: Option<PollOperationSuccess>,
 }

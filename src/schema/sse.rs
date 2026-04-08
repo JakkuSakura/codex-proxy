@@ -1,6 +1,6 @@
-use crate::schema::json_value::JsonValue;
 use crate::schema::openai::Tool;
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Serialize)]
@@ -38,7 +38,7 @@ pub struct FailedResponseObject {
     pub status: &'static str,
     pub model: String,
     pub error: ResponseError,
-    pub metadata: BTreeMap<String, JsonValue>,
+    pub metadata: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -82,8 +82,8 @@ pub struct ServerReasoningIncludedData {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RateLimitsData {
-    pub primary: Option<JsonValue>,
-    pub secondary: Option<JsonValue>,
+    pub primary: Option<Value>,
+    pub secondary: Option<Value>,
     pub credits: CreditsData,
 }
 
@@ -91,7 +91,7 @@ pub struct RateLimitsData {
 pub struct CreditsData {
     pub has_credits: bool,
     pub unlimited: bool,
-    pub balance: Option<JsonValue>,
+    pub balance: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -110,7 +110,7 @@ pub struct ResponseObject {
     pub tools: Vec<Tool>,
     pub parallel_tool_calls: bool,
     pub store: bool,
-    pub metadata: BTreeMap<String, JsonValue>,
+    pub metadata: BTreeMap<String, Value>,
     pub output: Vec<OutputItem>,
 
     #[serde(skip_serializing_if = "Option::is_none")]

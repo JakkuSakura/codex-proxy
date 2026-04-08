@@ -8,8 +8,8 @@ use std::pin::Pin;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
-use crate::schema::json_value::JsonValue;
 use crate::schema::openai::ChatRequest;
+use serde_json::Value;
 use crate::schema::sse::{
     CreditsData, FailedResponseObject, FunctionCallItem, InputTokensDetails, MessageItem,
     OutputContentPart, OutputItem, OutputTokensDetails, RateLimitsData, ReasoningContentPart,
@@ -65,12 +65,12 @@ pub fn stream_responses_sse(
             &mut seq_num,
             "rate_limits",
             RateLimitsData {
-                primary: Some(JsonValue::Null),
-                secondary: Some(JsonValue::Null),
+                primary: Some(Value::Null),
+                secondary: Some(Value::Null),
                 credits: CreditsData {
                     has_credits: true,
                     unlimited: false,
-                    balance: Some(JsonValue::Null),
+                    balance: Some(Value::Null),
                 },
             },
         ));
@@ -464,7 +464,7 @@ struct GeminiPart {
 struct GeminiFunctionCall {
     name: String,
     #[serde(default)]
-    args: JsonValue,
+    args: Value,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -545,10 +545,10 @@ fn set_item_status(item: &mut OutputItem, status: &str) {
 }
 
 fn extract_command_from_args(args: &str) -> Vec<String> {
-    let parsed: Result<JsonValue, _> = serde_json::from_str(args);
+    let parsed: Result<Value, _> = serde_json::from_str(args);
     match parsed {
-        Ok(JsonValue::Object(map)) => match map.get("command") {
-            Some(JsonValue::Array(arr)) => arr
+        Ok(Value::Object(map)) => match map.get("command") {
+            Some(Value::Array(arr)) => arr
                 .iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect(),

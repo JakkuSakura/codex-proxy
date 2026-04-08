@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::http::HeaderMap;
 use axum::response::Response;
 use serde_json::{Value, json};
+use tracing::info;
 
 use crate::account_pool::AccountAuth;
 use crate::config::{EffectiveReasoningConfig, with_config};
@@ -130,6 +131,18 @@ impl OpenAiProvider {
             format!("Bearer {api_key}").parse().map_err(|e| {
                 ProxyError::Internal(format!("Invalid OpenAI authorization header: {e}"))
             })?,
+        );
+
+        info!(
+            provider = context.provider(),
+            account_id = context.route.account_id.as_str(),
+            endpoint = endpoint_url,
+            model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("<missing>"),
+            max_tokens = payload.get("max_tokens").and_then(|v| v.as_u64()),
+            max_output_tokens = payload.get("max_output_tokens").and_then(|v| v.as_u64()),
+            has_reasoning = payload.get("reasoning").is_some(),
+            is_probe = payload.get("input").and_then(|v| v.as_str()) == Some("health check"),
+            "sending OpenAI-compatible upstream request"
         );
 
         self.client

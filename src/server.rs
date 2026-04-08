@@ -153,7 +153,22 @@ async fn run_recovery_probe_pass(state: &AppState) {
             stream: Some(false),
             include: None,
         };
-        let normalized = normalizer::normalize(raw.clone());
+        let normalized = crate::schema::openai::ChatRequest {
+            model: target.model.clone(),
+            messages: crate::schema::common::to_chat_messages(&[fp_agent::AgentMessage::user(
+                "health check".to_string(),
+            )]),
+            tools: Vec::new(),
+            tool_choice: Some("auto".to_string()),
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            stream: false,
+            store: false,
+            metadata: Default::default(),
+            previous_response_id: None,
+            include: Vec::new(),
+        };
         let provider = crate::providers::get_provider(state, &provider_name);
         let context = ProviderExecutionContext {
             route,

@@ -44,8 +44,6 @@ impl Provider for OpenRouterProvider {
         let mut payload =
             serde_json::to_value(raw_request).unwrap_or_else(|_| Value::Object(Default::default()));
 
-        // OpenRouter is OpenAI-compatible but stricter about nulls, and it expects
-        // Responses API token limit via max_output_tokens.
         strip_null_object_fields(&mut payload);
         ensure_max_output_tokens(&mut payload);
         ensure_openrouter_default_max_output_tokens(&mut payload, &context);
@@ -112,7 +110,4 @@ fn ensure_openrouter_default_max_output_tokens(
         "max_output_tokens".to_string(),
         Value::Number(default_max_output_tokens.into()),
     );
-    object
-        .entry("max_tokens".to_string())
-        .or_insert_with(|| Value::Number(default_max_output_tokens.into()));
 }
