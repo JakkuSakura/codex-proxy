@@ -1,6 +1,6 @@
 use super::pool::AccountPool;
 use crate::config::{EffectiveReasoningConfig, RouteTargetConfig};
-use crate::error::ProxyError;
+use crate::error::{ProviderError, ProxyError};
 use crate::schema::openai::{ChatContent, ChatMessage};
 use parking_lot::RwLock;
 use std::cmp::Reverse;
@@ -241,9 +241,10 @@ impl Router {
     ) -> Result<ResolvedRoute, ProxyError> {
         let decision = Self::route(pool, state, candidates, messages, cache_key_override)
             .ok_or_else(|| {
-                ProxyError::Provider(
-                    "No compatible healthy accounts available for any preferred target".into(),
-                )
+                ProxyError::Provider(ProviderError::new(
+                    None,
+                    "No compatible healthy accounts available for any preferred target",
+                ))
             })?;
         let candidate = candidates
             .iter()

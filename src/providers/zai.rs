@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,7 +7,7 @@ use tracing::info;
 
 use crate::account_pool::AccountAuth;
 use crate::config::with_config;
-use crate::error::ProxyError;
+use crate::error::{ProviderError, ProxyError};
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::openai::{ChatRequest, ResponsesRequest};
 use crate::schema::sse::{
@@ -86,9 +86,9 @@ impl ZAIProvider {
                     status, body
                 )));
             }
-            return Err(ProxyError::Provider(format!(
-                "Z.AI request failed ({}): {}",
-                status, body
+            return Err(ProxyError::Provider(ProviderError::new(
+                Some(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY)),
+                format!("Z.AI request failed ({}): {}", status, body),
             )));
         }
 
@@ -130,7 +130,10 @@ impl ZAIProvider {
     ) -> Result<Response<Body>, ProxyError> {
         let body_bytes = resp.bytes().await?;
         let z_data: ZaiChatResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
-            ProxyError::Provider(format!("Failed to decode Z.AI response JSON: {e}"))
+            ProxyError::Provider(ProviderError::new(
+                None,
+                format!("Failed to decode Z.AI response JSON: {e}"),
+            ))
         })?;
 
         let out = map_zai_response_to_responses_api(&z_data);

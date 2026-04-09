@@ -1,11 +1,11 @@
 use axum::body::Body;
-use axum::http::{HeaderMap, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth::AuthType;
 use crate::config::with_config;
-use crate::error::ProxyError;
+use crate::error::{ProviderError, ProxyError};
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::openai::{ChatRequest, ResponsesRequest};
 use fp_agent::providers::gemini::{GeminiInternalBody, build_gemini_request};
@@ -119,9 +119,9 @@ impl GeminiProvider {
                     status, body
                 )));
             }
-            return Err(ProxyError::Provider(format!(
-                "Gemini API error ({}): {}",
-                status, body
+            return Err(ProxyError::Provider(ProviderError::new(
+                Some(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY)),
+                format!("Gemini API error ({}): {}", status, body),
             )));
         }
 

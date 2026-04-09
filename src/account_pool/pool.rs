@@ -316,6 +316,26 @@ impl AccountPool {
         }
     }
 
+    pub fn mark_nonfatal_failure(&self, index: usize, error: Option<&str>) {
+        let guard = self.accounts.read();
+        if let Some((account, state)) = guard.get(index) {
+            let mut state = state.write();
+            let now = SystemTime::now();
+            state.last_failure_at = Some(now);
+            if let Some(error) = error {
+                state.last_error = Some(error.to_string());
+            }
+            state.alive = true;
+            state.recovery_probe_due = false;
+            state.unhealthy_until = None;
+            state.probe_in_progress.store(false, Ordering::Release);
+            debug!(
+                "Account {} ({}) recorded nonfatal failure",
+                account.id, account.provider
+            );
+        }
+    }
+
     pub fn increment_cache_hits(&self, index: usize) {
         let guard = self.accounts.read();
         if let Some((_, state)) = guard.get(index) {

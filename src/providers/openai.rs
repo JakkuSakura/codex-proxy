@@ -1,6 +1,7 @@
 use axum::body::Body;
 use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, HeaderName};
+use axum::http::StatusCode;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +13,7 @@ use fp_agent::providers::tabcode::{build_tabcode_compact_payload, build_tabcode_
 
 use crate::account_pool::AccountAuth;
 use crate::config::{EffectiveReasoningConfig, with_config};
-use crate::error::ProxyError;
+use crate::error::{ProviderError, ProxyError};
 use crate::providers::base::{Provider, ProviderExecutionContext};
 use crate::schema::openai::{ChatRequest, CompactRequest, ResponsesRequest};
 
@@ -28,6 +29,35 @@ struct OpenAiModelsResponse {
 #[derive(Debug, Deserialize)]
 struct OpenAiModelItem {
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorResponse {
+    error: OpenAiErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorBody {
+    message: String,
+    #[serde(rename = "type")]
+    error_type: Option<String>,
+    code: Option<OpenAiErrorCode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OpenAiErrorCode {
+    String(String),
+    Number(i64),
+}
+
+impl OpenAiErrorCode {
+    fn to_string(&self) -> String {
+        match self {
+            OpenAiErrorCode::String(value) => value.clone(),
+            OpenAiErrorCode::Number(value) => value.to_string(),
+        }
+    }
 }
 
 impl Clone for OpenAiProvider {
@@ -81,9 +111,12 @@ impl OpenAiProvider {
             cfg.provider_models_url(context.provider())
         })
         .ok_or_else(|| {
-            ProxyError::Provider(format!(
-                "Provider '{}' does not have a models_url configured",
-                context.provider()
+            ProxyError::Provider(ProviderError::new(
+                None,
+                format!(
+                    "Provider '{}' does not have a models_url configured",
+                    context.provider()
+                ),
             ))
         })
     }
@@ -198,19 +231,8 @@ impl OpenAiProvider {
         let response_headers = response.headers().clone();
         let bytes = response.bytes().await?;
 
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(ProxyError::Auth(format!(
-                "OpenAI request unauthorized ({}): {}",
-                status,
-                String::from_utf8_lossy(&bytes)
-            )));
-        }
         if !status.is_success() {
-            return Err(ProxyError::Provider(format!(
-                "OpenAI request failed ({}): {}",
-                status,
-                String::from_utf8_lossy(&bytes)
-            )));
+            return Err(ProxyError::Provider(parse_openai_error(status, &bytes)));
         }
 
         let mut builder = Response::builder().status(status);
@@ -237,19 +259,8 @@ impl OpenAiProvider {
         let response_headers = response.headers().clone();
         let bytes = response.bytes().await?;
 
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(ProxyError::Auth(format!(
-                "OpenAI request unauthorized ({}): {}",
-                status,
-                String::from_utf8_lossy(&bytes)
-            )));
-        }
         if !status.is_success() {
-            return Err(ProxyError::Provider(format!(
-                "OpenAI request failed ({}): {}",
-                status,
-                String::from_utf8_lossy(&bytes)
-            )));
+            return Err(ProxyError::Provider(parse_openai_error(status, &bytes)));
         }
 
         let mut builder = Response::builder().status(status);
@@ -344,14 +355,15 @@ impl Provider for OpenAiProvider {
             let status = resp.status();
             let body = resp.text().await.map_err(ProxyError::Http)?;
             if !status.is_success() {
-                return Err(ProxyError::Provider(format!(
-                    "Upstream models endpoint returned status {} body={}",
-                    status, body
+                return Err(ProxyError::Provider(ProviderError::new(
+                    Some(status),
+                    format!("Upstream models endpoint returned status {} body={}", status, body),
                 )));
             }
 
-            let parsed: OpenAiModelsResponse =
-                serde_json::from_str(&body).map_err(|e| ProxyError::Provider(e.to_string()))?;
+            let parsed: OpenAiModelsResponse = serde_json::from_str(&body).map_err(|e| {
+                ProxyError::Provider(ProviderError::new(None, e.to_string()))
+            })?;
             Ok(parsed.data.into_iter().map(|item| item.id).collect())
         })
     }
@@ -361,6 +373,26 @@ impl Provider for OpenAiProvider {
             client: self.client.clone(),
         })
     }
+}
+
+fn parse_openai_error(status: reqwest::StatusCode, bytes: &[u8]) -> ProviderError {
+    let fallback_message = String::from_utf8_lossy(bytes).to_string();
+    let parsed: Result<OpenAiErrorResponse, _> = serde_json::from_slice(bytes);
+    if let Ok(parsed) = parsed {
+        let code = parsed.error.code.map(|value| value.to_string());
+        return ProviderError::with_details(
+            Some(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY)),
+            parsed.error.message,
+            code,
+            parsed.error.error_type,
+        );
+    }
+    ProviderError::with_details(
+        Some(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY)),
+        fallback_message,
+        None,
+        None,
+    )
 }
 
 pub(crate) fn reasoning_effort(reasoning: &EffectiveReasoningConfig) -> &'static str {

@@ -19,7 +19,7 @@ use fp_agent::validate::{validate_compact_request, validate_responses_request};
 
 use crate::access::{AuthenticatedKey, require_admin};
 use crate::config::{PersistedConfig, with_config, with_config_mut};
-use crate::error::ProxyError;
+use crate::error::{ProviderError, ProviderErrorKind, ProxyError};
 use crate::providers::base::ProviderExecutionContext;
 use crate::schema::openai::{ChatMessage, CompactRequest, ResponsesRequest};
 use crate::state::AppState;
@@ -782,7 +782,7 @@ async fn finalize_response(
 
 fn is_context_length_error(error: &ProxyError) -> bool {
     let lower = match error {
-        ProxyError::Provider(msg) => msg.to_ascii_lowercase(),
+        ProxyError::Provider(err) => err.message.to_ascii_lowercase(),
         ProxyError::Validation(msg) => msg.to_ascii_lowercase(),
         ProxyError::Http(err) => err.to_string().to_ascii_lowercase(),
         ProxyError::Auth(_) => return false,
@@ -829,9 +829,10 @@ async fn auto_compact_request(
 
     let tail = cfg.tail_items_to_keep.max(1);
     if items.len() <= tail {
-        return Err(ProxyError::Provider(
-            "Auto-compaction skipped: not enough input items to compact".into(),
-        ));
+        return Err(ProxyError::Provider(ProviderError::new(
+            None,
+            "Auto-compaction skipped: not enough input items to compact",
+        )));
     }
 
     let prefix_items = items[..items.len() - tail].to_vec();
@@ -961,12 +962,13 @@ async fn run_native_compaction(
     let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024)
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read compaction response: {e}")))?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|e| ProxyError::Provider(e.to_string()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| ProxyError::Provider(ProviderError::new(None, e.to_string())))?;
     find_encrypted_content(&value).ok_or_else(|| {
-        ProxyError::Provider(
-            "Compaction response did not include an encrypted_content artifact".into(),
-        )
+        ProxyError::Provider(ProviderError::new(
+            None,
+            "Compaction response did not include an encrypted_content artifact",
+        ))
     })
 }
 
@@ -1046,10 +1048,13 @@ async fn run_summary_compaction(
     let bytes = to_bytes(resp.into_body(), 4 * 1024 * 1024)
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read summary response: {e}")))?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|e| ProxyError::Provider(e.to_string()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| ProxyError::Provider(ProviderError::new(None, e.to_string())))?;
     extract_output_text(&value).ok_or_else(|| {
-        ProxyError::Provider("Summary compaction response did not include output text".into())
+        ProxyError::Provider(ProviderError::new(
+            None,
+            "Summary compaction response did not include output text",
+        ))
     })
 }
 
@@ -1274,10 +1279,10 @@ mod auto_compaction_tests {
 
     #[test]
     fn detects_context_length_provider_error() {
-        let err = ProxyError::Provider(
-            "OpenAI request failed (400): This model's maximum context length is 128000 tokens"
-                .into(),
-        );
+        let err = ProxyError::Provider(ProviderError::new(
+            Some(StatusCode::BAD_REQUEST),
+            "OpenAI request failed (400): This model's maximum context length is 128000 tokens",
+        ));
         assert!(is_context_length_error(&err));
     }
 
@@ -1627,13 +1632,29 @@ fn record_and_apply_result(
             Ok(response)
         }
         Err(error) => {
-            let is_auth_error = is_auth_failure(&error);
             let reason = format_proxy_error(&error);
-            state.accounts().mark_failure(
-                context.route.account_index,
-                is_auth_error,
-                Some(reason.as_str()),
-            );
+            match error.provider_kind() {
+                Some(ProviderErrorKind::Client) => {
+                    state
+                        .accounts()
+                        .mark_nonfatal_failure(context.route.account_index, Some(reason.as_str()));
+                }
+                Some(ProviderErrorKind::Auth) => {
+                    state.accounts().mark_failure(
+                        context.route.account_index,
+                        true,
+                        Some(reason.as_str()),
+                    );
+                }
+                _ => {
+                    let is_auth_error = is_auth_failure(&error);
+                    state.accounts().mark_failure(
+                        context.route.account_index,
+                        is_auth_error,
+                        Some(reason.as_str()),
+                    );
+                }
+            }
             Err(error)
         }
     }
@@ -1692,9 +1713,7 @@ fn is_auth_failure(error: &ProxyError) -> bool {
             .status()
             .map(|status| status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN)
             .unwrap_or(false),
-        ProxyError::Provider(message) => {
-            message.contains("401") || message.contains("403") || message.contains("unauthorized")
-        }
+        ProxyError::Provider(err) => matches!(err.kind(), ProviderErrorKind::Auth),
         _ => false,
     }
 }
